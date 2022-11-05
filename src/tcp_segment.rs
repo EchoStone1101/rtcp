@@ -25,7 +25,7 @@ pub mod tcp_segment {
         pub urg_ptr: u16,
 
         // Options are recognized but not handled
-        _options: (),
+        pub _options: (),
     }
 
     impl TCPHeader {
@@ -38,7 +38,7 @@ pub mod tcp_segment {
                 return Err(RtcpError::InvalidSegment("reserved bits non zero"));
             }
             let data_ofs = buf[12] & 0b1111;
-            if (data_ofs * 5) as usize > buf.len() {
+            if (data_ofs * 4) as usize > buf.len() {
                 return Err(RtcpError::InvalidSegment("header too small"));
             }
             
@@ -78,14 +78,14 @@ pub mod tcp_segment {
             if self.data_ofs < 5 {
                 return Err(RtcpError::InvalidSegment("data_ofs too small"));
             }
-            if buf.len() < (self.data_ofs as usize) * 5 {
+            if buf.len() < (self.data_ofs as usize) * 4 {
                 return Err(RtcpError::BufError("buffer too small"));
             }
 
-            buf.copy_from_slice(&self.src_port.to_be_bytes());
-            buf[2..].copy_from_slice(&self.dst_port.to_be_bytes());
-            buf[4..].copy_from_slice(&self.seq.to_be_bytes());
-            buf[8..].copy_from_slice(&self.ack.to_be_bytes());
+            buf[0..2].copy_from_slice(&self.src_port.to_be_bytes());
+            buf[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
+            buf[4..8].copy_from_slice(&self.seq.to_be_bytes());
+            buf[8..12].copy_from_slice(&self.ack.to_be_bytes());
             buf[12] = self.data_ofs & 0b1111;
 
             buf[13] = 0;
@@ -96,12 +96,12 @@ pub mod tcp_segment {
             buf[13] |= if self.is_syn {0b1000000} else {0};
             buf[13] |= if self.is_fin {0b10000000} else {0};
 
-            buf[14..].copy_from_slice(&self.wnd.to_be_bytes());
-            buf[16..].copy_from_slice(&self.checksum.to_be_bytes());
-            buf[18..].copy_from_slice(&self.urg_ptr.to_be_bytes());
+            buf[14..16].copy_from_slice(&self.wnd.to_be_bytes());
+            buf[16..18].copy_from_slice(&self.checksum.to_be_bytes());
+            buf[18..20].copy_from_slice(&self.urg_ptr.to_be_bytes());
 
             // Zeroes the options field
-            buf[20..(self.data_ofs as usize * 5)].fill(0);
+            buf[20..(self.data_ofs as usize * 4)].fill(0);
 
             Ok(())
         }

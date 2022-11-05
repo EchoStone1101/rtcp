@@ -9,3 +9,31 @@ gcc -o ./build/hello hello.c \
     -Wl,--wrap,close \
     -Wl,--wrap,getaddrinfo \
     -L. -l:../target/debug/librtcp.so
+
+gcc -o ./build/active active.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/debug -lrtcp
+
+gcc -o ./build/passive passive.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/debug -lrtcp

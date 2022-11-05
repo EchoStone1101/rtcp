@@ -11,12 +11,14 @@ pub mod tcp {
     //! of the specification will not be reachable. We layout the sketch
     //! for these cases, only to handle them with a runtime panic.
     
+    #[allow(unused)]
+    
+    use rip::{RipPacket, Ipv4Packet, RipCtl};
     use crate::{TCBS, MAX_SOCKET_FD, RtcpError, TCPHeader, TCPSegment};
     use std::collections::{VecDeque, LinkedList};
     use std::net::Ipv4Addr;
     use std::sync::{Mutex, Condvar};
-    use chrono::{Duration, Utc};
-
+    use chrono::Utc;
 
     /// An unspecified port.
     pub const UNSPECIFIED_PORT: u16 = 0;
@@ -25,7 +27,7 @@ pub mod tcp {
     pub const TCP_GLOBAL_TIMEOUT: usize = 5 * 60 * 1000;
 
     /// TCP buffer size.
-    pub const TCP_BUFFER_SZ: usize = 65536;
+    pub const TCP_BUFFER_SZ: usize = 32768;
 
     /// The Transmission Control Block, one for each endpoint of a 
     /// TCP connection. 
@@ -60,8 +62,8 @@ pub mod tcp {
         /// Whether this TCB is opened passively or not. 
         pub passive: bool,
 
-        send_buf: TcpSendBuf,
-        recv_buf: TcpRecvBuf,
+        pub send_buf: TcpSendBuf,
+        pub recv_buf: TcpRecvBuf,
     }
 
     impl _TCB {
@@ -74,11 +76,12 @@ pub mod tcp {
 
             self.state = TcpState::Closed;
             self.passive = false;
+
         }
     }
 
     #[derive(Debug)]
-    struct TcpSendBuf {
+    pub struct TcpSendBuf {
         /// Cicurlar data buffer
         pub buf: Box<[u8; TCP_BUFFER_SZ]>,
         /// Oldest Unacked SEQ
@@ -86,7 +89,7 @@ pub mod tcp {
         /// Next SEQ to be sent
         pub snd_nxt: u32,
         /// Sender window
-        pub snd_wnd: u32,
+        pub snd_wnd: u16,
         /// Segment SEQ used for last window update
         pub snd_wl1: u32,
         /// Segment ACK used for last window update
@@ -96,32 +99,409 @@ pub mod tcp {
         pub iss: u32,
 
         /// Retransmission queue (start, end, timestamp)
-        pub re_rx_queue: VecDeque<(u32, u32, u64)>,
+        pub re_rx_queue: VecDeque<ReRxItem>,
+
+        /// Send handle
+        pub tx: flume::Sender<RipPacket>,
+    }
+
+    /// A segment in retransmission queue.
+    #[derive(Debug)]
+    pub struct ReRxItem {
+        pub start: u32,
+        pub end: u32,
+        pub timestamp: u64,
+        pub is_syn: bool,
+        pub is_fin: bool,
+    }
+
+    impl TcpSendBuf {
+        /// Put `data` into buffer, and register the segment 
+        /// in re_rx_queue. The validity of this call should be
+        /// checked beforehand.
+        fn put(&mut self, is_syn: bool, is_fin: bool, data: &[u8]) {
+            assert!(data.len() < TCP_BUFFER_SZ as usize);
+            assert!(u64::wrapping_add(self.snd_nxt as u64, data.len() as u64) <= u64::wrapping_add(self.snd_una as u64, self.snd_wnd as u64));
+            let virt_len = data.len() as u32 
+                + if is_syn {1} else {0}
+                + if is_fin {1} else {0};
+
+            if data.len() > 0 {
+                // Make sure we do not overwrite buffer
+                assert!(u64::wrapping_add(self.snd_una as u64, TCP_BUFFER_SZ as u64) > u64::wrapping_add(self.snd_nxt as u64, virt_len as u64));
+
+                let mut left = self.snd_nxt as u16;
+                if left > TCP_BUFFER_SZ as u16 {
+                    left -= TCP_BUFFER_SZ as u16;
+                }
+                let right = left + data.len() as u16;
+                if right > TCP_BUFFER_SZ as u16 {
+                    self.buf[left as usize..].copy_from_slice(&data[..(TCP_BUFFER_SZ as u16 - left) as usize]);
+                    self.buf[..(right-TCP_BUFFER_SZ as u16) as usize].copy_from_slice(&data[(TCP_BUFFER_SZ as u16 - left) as usize..]);
+                }
+                else {
+                    self.buf[left as usize..right as usize].copy_from_slice(data);
+                }
+            }
+
+            
+            // For any TCP connection, there is exactly one extra byte for SYN and FIN.
+            // The SYN will not cause problem because it occupies empty buffer. The FIN,
+            // however, can cause snd_nxt > snd_una + TCP_BUFFER_SZ, where a next put()
+            // will panic as left > TCP_BUFFER_SZ. This is fine, though, since FIN is the
+            // last possible message to be put into buffer.
+               
+            self.re_rx_queue.push_back(ReRxItem {
+                start: self.snd_nxt,
+                end: u32::wrapping_add(self.snd_nxt, virt_len),
+                timestamp: tcp_timestamp(),
+                is_syn,
+                is_fin,
+            });
+            self.snd_nxt = u32::wrapping_add(self.snd_nxt, virt_len);
+        }
+
+        /// Send a bare SYN segment
+        pub fn send_syn(&mut self, conn: &TcpConnection, wnd: u16, ack: u32, is_ack: bool) {
+            let mut buf = [0u8; 20];
+            let hdr = TCPHeader {
+                src_port: conn.src_port,
+                dst_port: conn.dst_port,
+                seq: self.snd_nxt,
+                ack,
+                data_ofs: 5,
+                is_urg: false, is_ack, is_psh: false, is_rst: false, is_fin: false,
+                is_syn: true,
+                wnd,
+                checksum: 0,
+                urg_ptr: 0,
+                _options: (),
+            };
+            // No actual data, must succeed
+            self.put(hdr.is_syn, hdr.is_fin, &[]);
+            _ = RipCtl::send_ipv4_packet(
+                &mut self.tx,
+                conn.src_ip,
+                conn.dst_ip,
+                {
+                    hdr.serialize(&mut buf).unwrap();
+                    &mut buf
+                }
+            ).unwrap();
+        }
+
+        /// Send a bare FIN segment
+        pub fn send_fin(&mut self, conn: &TcpConnection, wnd: u16, ack: u32) {
+            let mut buf = [0u8; 20];
+            let hdr = TCPHeader {
+                src_port: conn.src_port,
+                dst_port: conn.dst_port,
+                seq: self.snd_nxt,
+                ack,
+                data_ofs: 5,
+                is_urg: false, is_psh: false, is_rst: false, is_syn: false,
+                is_ack: true, // FIN must have ACK set
+                is_fin: true,
+                wnd,
+                checksum: 0,
+                urg_ptr: 0,
+                _options: (),
+            };
+            // No actual data, must succeed
+            self.put(hdr.is_syn, hdr.is_fin, &[]);
+            _ = RipCtl::send_ipv4_packet(
+                &mut self.tx,
+                conn.src_ip,
+                conn.dst_ip,
+                {
+                    hdr.serialize(&mut buf).unwrap();
+                    &mut buf
+                }
+            ).unwrap();
+        }
+
+        /// Send a bare ACK segment
+        pub fn send_ack(&mut self, conn: &TcpConnection, wnd: u16, ack: u32) {
+            let mut buf = [0u8; 20];
+            let hdr = TCPHeader {
+                src_port: conn.src_port,
+                dst_port: conn.dst_port,
+                seq: self.snd_nxt,
+                ack,
+                data_ofs: 5,
+                is_urg: false, is_fin: false, is_psh: false, is_rst: false, is_syn: false,
+                is_ack: true,
+                wnd,
+                checksum: 0,
+                urg_ptr: 0,
+                _options: (),
+            };
+            // No actual data, must succeed
+            self.put(hdr.is_syn, hdr.is_fin, &[]);
+            _ = RipCtl::send_ipv4_packet(
+                &mut self.tx,
+                conn.src_ip,
+                conn.dst_ip,
+                {
+                    hdr.serialize(&mut buf).unwrap();
+                    &mut buf
+                }
+            ).unwrap();
+        }
+
+        /// Send a bare RST segment.
+        /// RSTs are not put into re_rx_queue, and they might use different SEQ and ACK settings
+        /// than what Self keeps.
+        pub fn send_rst(&mut self, 
+            conn: &TcpConnection, 
+            wnd: u16, 
+            seq: u32,
+            ack: u32, is_ack: bool) {
+            let mut buf = [0u8; 20];
+            let hdr = TCPHeader {
+                src_port: conn.src_port,
+                dst_port: conn.dst_port,
+                seq,
+                ack,
+                data_ofs: 5,
+                is_urg: false, is_ack, is_psh: false, is_fin: false, is_syn: false,
+                is_rst: true,
+                wnd,
+                checksum: 0,
+                urg_ptr: 0,
+                _options: (),
+            };
+            
+            _ = RipCtl::send_ipv4_packet(
+                &mut self.tx,
+                conn.src_ip,
+                conn.dst_ip,
+                {
+                    hdr.serialize(&mut buf).unwrap();
+                    &mut buf
+                }
+            ).unwrap();
+        }
+
+        /// Put data into this send buffer, and send it. Do not support data 
+        /// with SYN and FIN.
+        /// The behavior is "retry until at least one byte gets put"; `data`
+        /// can also be larger than buffer size, where it is guaranteed that
+        /// all of the buffer is not put into buffer.
+        pub fn send_text(&mut self, conn: &TcpConnection, data: &[u8], wnd: u16, ack: u32) -> Result<usize, RtcpError> {
+            // Check for buffer space
+            let free = u32::saturating_sub(u32::wrapping_add(self.snd_una, self.snd_wnd as u32), self.snd_nxt);
+            if free == 0 {
+                return Err(RtcpError::TCPCommandRetry);
+            }
+            let bytes_sent = std::cmp::min(free as usize, data.len());
+
+            let mut buf = [0u8; 20];
+            let hdr = TCPHeader {
+                src_port: conn.src_port,
+                dst_port: conn.dst_port,
+                seq: self.snd_nxt,
+                ack,
+                data_ofs: 5,
+                is_urg: false, is_psh: false, is_fin: false, is_syn: false,
+                is_rst: true, is_ack: true,
+                wnd,
+                checksum: 0,
+                urg_ptr: 0,
+                _options: (),
+            };
+
+            self.put(false, false, &data[..bytes_sent as usize]);
+
+            // TODO: MAX_PAYLOAD_SZ
+            _ = RipCtl::send_ipv4_packet_with_header(
+                &mut self.tx,
+                conn.src_ip,
+                conn.dst_ip,
+                {
+                    hdr.serialize(&mut buf).unwrap();
+                    &buf
+                },
+                &data[..bytes_sent as usize],
+            ).unwrap();
+            Ok(bytes_sent)
+        }
+
+        /// ACK data in this send buffer, so that snd_una can be moved, and retransmission
+        /// queue can be popped. `ack` should be checked beforehand and is assumed acceptable.
+        pub fn ack(&mut self, ack: u32) -> (bool, bool) {
+            let mut syn_acked = false;
+            let mut fin_acked = false;
+            while !self.re_rx_queue.is_empty() {
+                let item = self.re_rx_queue.front_mut().unwrap();
+                if i32::wrapping_sub(ack as i32, item.start as i32) < 0 {
+                    break;
+                }
+                if i32::wrapping_sub(ack as i32, item.end as i32) >= 0 {
+                    if item.is_syn {
+                        syn_acked = true;
+                    }
+                    if item.is_fin {
+                        fin_acked = true;
+                    }
+                    drop(item);
+                    self.re_rx_queue.pop_front();
+                }
+                else {
+                    item.start = ack;
+                    break;
+                }
+            }
+            // Advance SND.UNA
+            self.snd_una = ack;
+
+            (syn_acked, fin_acked)
+        }
+
     }
 
     #[derive(Debug)]
-    struct TcpRecvBuf {
+    pub struct TcpRecvBuf {
         /// Cicurlar data buffer
         pub buf: Box<[u8; TCP_BUFFER_SZ]>,
+        /// Oldest Unconsumed SEQ
+        pub rcv_unc: u32,
         /// Next SEQ expected on incoming segments
         pub rcv_nxt: u32,
         /// Receive window
-        pub rcv_wnd: u32,
+        pub rcv_wnd: u16,
         
         /// Initial receive SEQ
         pub irs: u32,
 
+        /// Whether FIN is received. FIN will cause one extra
+        /// bit in buffer that should not be received by user.
+        pub finned: bool,
+
         /// Received segment queue, not necessarily cummulative.
         /// Essentially implements Selective-Repeat.
-        pub seg_queue: LinkedList<(u32, u32)>
+        pub seg_queue: LinkedList<SegItem>,
+    }
+
+    impl TcpRecvBuf {
+        /// Put `data` into buffer, and register the segment 
+        /// in seg_queue. The validity of this call should be
+        /// checked beforehand.
+        /// 
+        /// Note that, unlike `TcpSendBuf`, SYN and FIN segments should
+        /// never be put into receive buffer. The handling of these segments
+        /// are restricted to only the `seg_arrives()` event, where their SEG.SEQ
+        /// must match RCV.NXT. In other words, we do not handle control segments
+        /// with delay, and a future SYN/FIN is simply dropped (maybe re-rxed).
+        pub fn put(&mut self, data: &[u8], seg_seq: u32) {
+            assert!(data.len() < TCP_BUFFER_SZ as usize);
+            assert!(u64::wrapping_add(seg_seq as u64, data.len() as u64) <= u64::wrapping_add(self.rcv_nxt as u64, self.rcv_wnd as u64));
+            assert!(i32::wrapping_sub(seg_seq as i32, self.rcv_nxt as i32) >= 0);
+
+            // Make sure we do not overwrite buffer
+            assert!(u64::wrapping_add(self.rcv_unc as u64, TCP_BUFFER_SZ as u64) >= u64::wrapping_add(self.rcv_nxt as u64, self.rcv_wnd as u64));
+
+            let mut left = seg_seq as u16;
+            if left > TCP_BUFFER_SZ as u16 {
+                left -= TCP_BUFFER_SZ as u16;
+            }
+            let right = left + data.len() as u16;
+            if right > TCP_BUFFER_SZ as u16 {
+                self.buf[left as usize..].copy_from_slice(&data[..(TCP_BUFFER_SZ as u16 - left) as usize]);
+                self.buf[..(right-TCP_BUFFER_SZ as u16) as usize].copy_from_slice(&data[(TCP_BUFFER_SZ as u16 - left) as usize..]);
+            }
+            else {
+                self.buf[left as usize..right as usize].copy_from_slice(data);
+            }
+
+            // Manipulate `seg_queue`; insert and coalesce this segment.
+            let queue = &mut self.seg_queue;
+            let mut split_idx: usize = 0;
+            for (idx, item) in queue.iter().enumerate() {
+                split_idx = idx;
+                if i32::wrapping_sub(item.end as i32, seg_seq as i32) >= 0 {
+                    break;
+                }
+            }
+            let mut part = queue.split_off(split_idx);
+            let mut new_end = u32::wrapping_add(seg_seq, data.len() as u32);
+            let mut new_start = seg_seq;
+            while !part.is_empty() {
+                let &SegItem { start, end} = part.front().unwrap();
+
+                if i32::wrapping_sub(start as i32, new_end as i32) <= 0 {
+                    _ = part.pop_front().unwrap();
+                    if i32::wrapping_sub(new_start as i32, start as i32) > 0 {
+                        new_start = start;
+                    }
+                    if i32::wrapping_sub(end as i32, new_end as i32) > 0 {
+                        new_end = end;
+                    }
+                }
+                else {
+                    break;
+                }
+            }
+            part.push_front(SegItem {start: new_start, end: new_end});
+            self.seg_queue.append(&mut part);
+
+            // Check if we can move RCV.NXT
+            let &SegItem{start, end} = self.seg_queue.front().unwrap();
+            if start == self.rcv_nxt {
+                _ = self.seg_queue.pop_front().unwrap();
+                self.rcv_nxt = end;
+                self.rcv_wnd = u16::checked_sub(self.rcv_wnd, u32::wrapping_sub(end, start) as u16).unwrap();
+            }
+        }
+
+        /// Get text from buffer.
+        /// The behavior is "retry until at least one byte can be got"; `data`
+        /// can also be larger than buffer size, where it is guaranteed that
+        /// all of `data` is not filled.
+        pub fn get_text(&mut self, data: &mut [u8]) -> Result<usize, RtcpError> {
+            // Check for buffer space
+            let avail = u32::checked_sub(
+                u32::saturating_sub(self.rcv_nxt, self.rcv_unc), 
+                if self.finned {1} else {0}
+            ).unwrap();
+            if avail == 0 {
+                return Err(RtcpError::TCPCommandRetry);
+            }
+            let bytes_rcvd = std::cmp::min(avail as usize, data.len());
+
+
+            let mut left = self.rcv_unc as u16;
+            if left > TCP_BUFFER_SZ as u16 {
+                left -= TCP_BUFFER_SZ as u16;
+            }
+            let right = left + bytes_rcvd as u16;
+            if right > TCP_BUFFER_SZ as u16 {
+                data[..(TCP_BUFFER_SZ as u16 - left) as usize].copy_from_slice(&self.buf[left as usize..]);
+                data[(TCP_BUFFER_SZ as u16 - left) as usize..bytes_rcvd].copy_from_slice(&self.buf[..(right-TCP_BUFFER_SZ as u16) as usize]);
+            }
+            else {
+                data[..bytes_rcvd].copy_from_slice(&self.buf[left as usize..right as usize]);
+            }
+            self.rcv_unc = u32::wrapping_add(self.rcv_unc, bytes_rcvd as u32);
+            self.rcv_wnd = u16::wrapping_add(self.rcv_wnd, bytes_rcvd as u16);
+            
+            Ok(bytes_rcvd)
+        }
+    }
+
+    /// A segment in receiver segment queue, for selective repeat.
+    #[derive(Debug)]
+    pub struct SegItem {
+        pub start: u32,
+        pub end: u32,
     }
 
     /// A TCP connection, identified by the quad.
     #[derive(Debug, Clone, Copy)]
     pub struct TcpConnection {
         pub src_ip: Ipv4Addr,
-        pub src_port: u16,
         pub dst_ip: Ipv4Addr,
+        pub src_port: u16,
         pub dst_port: u16,
     }
 
@@ -131,8 +511,9 @@ pub mod tcp {
         }
     }
 
+
     /// The states in a TCP state machine.
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub enum TcpState {
         Closed,
         Listen,
@@ -147,16 +528,45 @@ pub mod tcp {
         TimeWait,
     }
 
+    /// Generate timestamp for use in TCP. 
+    fn tcp_timestamp() -> u64 {
+        Utc::now().timestamp_micros() as u64
+    }
+
+    /// Generate ISN based on a timer that increments approximately
+    /// every 4ms.
+    fn tcp_gen_seq() -> u32 {
+        (tcp_timestamp() as u32)>>2
+    }
+
+    /// TCP STATUS command.
+    pub fn tcp_status(id: usize) -> TcpState {
+        assert!(id < MAX_SOCKET_FD);
+
+        let guard = TCBS[id].inner.lock().unwrap();
+        assert!(!guard.is_none());
+
+        let send_buf = &guard.as_ref().unwrap().send_buf;
+        eprintln!("iss:{}, una:{}, nxt:{}, wnd:{}", send_buf.iss, send_buf.snd_una, send_buf.snd_nxt, send_buf.snd_wnd);
+        let recv_buf = &guard.as_ref().unwrap().recv_buf;
+        eprintln!("irs:{}, unc:{}, nxt:{}, wnd:{}", recv_buf.irs, recv_buf.rcv_unc, recv_buf.rcv_nxt, recv_buf.rcv_wnd);
+
+        guard.as_ref().unwrap().state
+    }
 
     /// Pseudo TCP CREATE command.
     /// Actual TCP creates TCB upon OPEN command; but for management reasons,
     /// it would be easier to break it down. Here, CREATE makes a CLOSED TCB,
     /// and OPEN acts on a given TCB just like any other TCP command.
-    pub fn tcp_create(id: usize) -> Result<(), RtcpError>{
+    pub fn tcp_create(
+        id: usize, 
+        tx: flume::Sender<RipPacket>) 
+        -> Result<(), RtcpError>
+    {
         assert!(id < MAX_SOCKET_FD);
-        let mut guard = TCBS[id].inner.lock().unwrap();
-        assert!(!guard.is_none());
 
+        let mut guard = TCBS[id].inner.lock().unwrap();
+        assert!(guard.is_none());
         _ = guard.insert(_TCB {
                 conn: TcpConnection { 
                     src_ip: Ipv4Addr::UNSPECIFIED, 
@@ -170,21 +580,24 @@ pub mod tcp {
                     buf: Box::new([0u8; TCP_BUFFER_SZ]),
                     snd_una: 0,
                     snd_nxt: 0,
-                    snd_wnd: 0,
+                    snd_wnd: TCP_BUFFER_SZ as u16,
                     snd_wl1: 0,
                     snd_wl2: 0,
                     iss: 0,
                     re_rx_queue: VecDeque::new(),
+                    tx,
                 },
                 recv_buf: TcpRecvBuf {
                     buf: Box::new([0u8; TCP_BUFFER_SZ]),
+                    rcv_unc: 0,
                     rcv_nxt: 0,
-                    rcv_wnd: 0,
+                    rcv_wnd: TCP_BUFFER_SZ as u16,
                     irs: 0,
+                    finned: false,
                     seg_queue: LinkedList::new(),
-                },
+                }
         });
-        drop(guard);
+
         Ok(())
     }
 
@@ -215,27 +628,26 @@ pub mod tcp {
                     if tcb.conn.dst_sock_unspecified() {
                         return Err(RtcpError::InvalidStateTransition("error: foreign socket unspecified"))
                     }
-                    // Send SYN
-
                     tcb.state = TcpState::SynSent;
+
+                    // Send SYN
+                    let send_buf = &mut tcb.send_buf;
+                    let iss = tcp_gen_seq();
+                    send_buf.iss = iss;
+                    send_buf.snd_una = iss;
+                    send_buf.snd_nxt = iss; // Will add one after send_syn()
+                    send_buf.snd_wl1 = iss;
+                    send_buf.snd_wl2 = iss;
+                    
+                    send_buf.send_syn(&tcb.conn, tcb.recv_buf.rcv_wnd, 0, false); // <SEQ=ISS><CTL=SYN>
+                    
                     Ok(())
                 }
                 
             },
             TcpState::Listen => {
-                if !passive {
-                    if tcb.conn.dst_sock_unspecified() {
-                        return Err(RtcpError::InvalidStateTransition("error: foreign socket unspecified"))
-                    }
-                    // Change from passive to active, select ISS
-                    // Send SYN
-                    tcb.passive = passive;
-                    tcb.state = TcpState::SynSent;
-                    Ok(())
-                }
-                else {
-                    return Err(RtcpError::InvalidStateTransition("error: is already passive"))
-                }
+                // POSIX prevents this from happening
+                unreachable!()
             },
             _ => {
                 Err(RtcpError::InvalidStateTransition("error: connection already exists"))
@@ -262,44 +674,41 @@ pub mod tcp {
     /// TCP SEND internal.
     fn tcp_send_once(
         id: usize,
-        _buf: &[u8],
+        buf: &[u8],
         _push: bool,
         _urgent: bool) -> Result<usize, RtcpError>
     {
         assert!(id < MAX_SOCKET_FD);
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
-        let mut tcb = guard.as_mut().unwrap();
+        let tcb = guard.as_mut().unwrap();
 
         match tcb.state {
             TcpState::Closed => {
                 Err(RtcpError::InvalidStateTransition("error: connection does not exist"))
             },
             TcpState::Listen => {
-                if tcb.conn.dst_sock_unspecified() {
-                    return Err(RtcpError::InvalidStateTransition("error: foreign socket unspecified"))
-                }
-                // Change from passive to active, select ISS
-                // Send SYN
-                tcb.state = TcpState::SynSent;
-
-                // Retry this command
-                _ = TCBS[id].retry.wait(guard).unwrap();
-                Err(RtcpError::TCPCommandRetry)
+                // POSIX prevents this from happening
+                unreachable!()
             },
             TcpState::SynSent | TcpState::SynReceived => {
-                // Queue the data, or Err
-
-                // Retry this command
+                // accpet() will return connfd in SynRcvd
                 _ = TCBS[id].retry.wait(guard).unwrap();
                 Err(RtcpError::TCPCommandRetry)
             },
             TcpState::Established | TcpState::CloseWait => {
-                // TODO: Send data, or Err
+                // Segmentize the buffer
+                let send_buf = &mut tcb.send_buf;
 
-                // Retry this command
-                _ = TCBS[id].retry.wait(guard).unwrap();
-                Err(RtcpError::TCPCommandRetry)
+                let res = send_buf.send_text(
+                    &tcb.conn, buf, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt
+                );
+                if matches!(res, Err(RtcpError::TCPCommandRetry)) {
+                    // Retry this command
+                    _ = TCBS[id].retry.wait(guard).unwrap();
+                }
+                // TODO: issue a send buffer flush?
+                res
             },
             _ => {
                 Err(RtcpError::InvalidStateTransition("error: connection closing"))
@@ -307,7 +716,7 @@ pub mod tcp {
         }
     }
 
-    /// TCP SEND command
+    /// TCP RECEIVE command
     pub fn tcp_recv(
         id: usize,
         _buf: &mut [u8],
@@ -323,35 +732,45 @@ pub mod tcp {
         }
     }
 
+    /// TCP RECEIVE internal
     fn tcp_recv_once(
         id: usize,
-        _buf: &mut [u8],
+        buf: &mut [u8],
         _push: bool,
         _urgent: bool) -> Result<usize, RtcpError> 
     {
         assert!(id < MAX_SOCKET_FD);
-        let guard = TCBS[id].inner.lock().unwrap();
+        let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
-        let tcb = guard.as_ref().unwrap();
+        let tcb = guard.as_mut().unwrap();
 
         match tcb.state {
             TcpState::Closed => {
                 Err(RtcpError::InvalidStateTransition("error: connection does not exist"))
             },
             TcpState::Listen | TcpState::SynSent | TcpState::SynReceived => {
-                // TODO: queue the request, or Err
-
                 // Retry this command
                 _ = TCBS[id].retry.wait(guard).unwrap();
                 Err(RtcpError::TCPCommandRetry)
             },
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
-                // TODO: reassemble data and return 
-                Ok(0)
+                // Retrieve data between RCV.UNC and RCV.NXT, if any
+                let recv_buf = &mut tcb.recv_buf;
+                let res = recv_buf.get_text(buf);
+                if matches!(res, Err(RtcpError::TCPCommandRetry)) {
+                    // Retry this command
+                    _ = TCBS[id].retry.wait(guard).unwrap();
+                }
+                res
             },
             TcpState::CloseWait => {
-                // TODO: reassemble data and return, or Err(closing)
-                Ok(0)
+                // Likewise, but no retry since FIN is received
+                let recv_buf = &mut tcb.recv_buf;
+                let res = recv_buf.get_text(buf);
+                if matches!(res, Err(RtcpError::TCPCommandRetry)) {
+                    return Err(RtcpError::InvalidStateTransition("error: connection closing"))
+                }
+                res
             },
             _ => {
                 Err(RtcpError::InvalidStateTransition("error: connection closing"))
@@ -359,6 +778,7 @@ pub mod tcp {
         }
     }
 
+    
     /// TCP CLOSE command.
     /// 
     /// Note that for simplicity, this implementation treats CLOSE as if it
@@ -386,19 +806,22 @@ pub mod tcp {
                 Ok(())
             },
             TcpState::SynReceived => {
-                // Terminate outstanding RECV/SENDs
                 tcb.state = TcpState::FinWait1;
-                // TODO: send a FIN
+
+                // POSIX ensures that the send_buf must be empty (no text).
+                // Send a FIN.
+                tcb.send_buf.send_fin(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+
+                // Terminate outstanding RECV/SENDs right away.
                 TCBS[id].retry.notify_all();
                 Ok(())
             },
             TcpState::Established => {
-                // Wait until send buffer is empty?
-                // this is different from pending SENDs, which is not
-                // in buffer yet.
+                // TODO: issue a send buffer flush?
 
                 tcb.state = TcpState::FinWait1;
-                // TODO: send a FIN
+                // Send a FIN.
+                tcb.send_buf.send_fin(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
                 TCBS[id].retry.notify_all();
                 Ok(())
             },
@@ -406,12 +829,12 @@ pub mod tcp {
                 Err(RtcpError::InvalidStateTransition("error: connection closing"))
             },
             TcpState::CloseWait => {
-                // Wait until send buffer is empty?
-                // this is different from pending SENDs, which is not
-                // in buffer yet.
+                // TODO: issue a send buffer flush?
 
-                // TODO: send a FIN
                 tcb.state = TcpState::Closing;
+                // Send a FIN.
+                tcb.send_buf.send_fin(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                TCBS[id].retry.notify_all();
                 Ok(())
             },
             _ => {
@@ -441,9 +864,14 @@ pub mod tcp {
             TcpState::SynReceived | TcpState::Established |
             TcpState::FinWait1 | TcpState::FinWait2 |
             TcpState::CloseWait => {
-                // TODO: Send RST
-                // TODO: Flush send buffer?
+                // TODO: issue a send buffer flush?
                 tcb.clear();
+
+                // Send a RST
+                tcb.send_buf.send_rst(&tcb.conn,
+                    tcb.recv_buf.rcv_wnd, 
+                    tcb.send_buf.snd_nxt,
+                    tcb.recv_buf.rcv_nxt, true);
                 // Terminate outstanding RECV/SENDs
                 TCBS[id].retry.notify_all();
                 Ok(())
@@ -458,7 +886,7 @@ pub mod tcp {
     /// TCP SEGMENT-ARRIVES event.
     pub fn tcp_seg_arrive(
         id: usize,
-        seg: TCPSegment,
+        mut seg: TCPSegment,
     ) {
         assert!(id < MAX_SOCKET_FD);
         let mut guard = TCBS[id].inner.lock().unwrap();
@@ -469,8 +897,22 @@ pub mod tcp {
             TcpState::Closed => {
                 // Discard data
                 if !seg.header.is_rst {
+                    let conn = TcpConnection {
+                        dst_ip: seg.src_ip,
+                        dst_port: seg.header.src_port,
+                        src_port: seg.header.dst_port,
+                        src_ip: Ipv4Addr::UNSPECIFIED,
+                    };
                     // Send back a RST
-                    let _seq = if seg.header.is_ack {seg.header.ack} else {0};
+                    if seg.header.is_ack {
+                        // <SEQ=SEG.ACK><CTL=RST>
+                        tcb.send_buf.send_rst(&conn, tcb.recv_buf.rcv_wnd, seg.header.ack, 0, false);
+                    }
+                    else {
+                        // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+                        tcb.send_buf.send_rst(&conn, tcb.recv_buf.rcv_wnd, 0, seg.header.seq + seg.data.len() as u32, true);
+                    }
+
                 }
             },
             TcpState::Listen => {
@@ -480,25 +922,33 @@ pub mod tcp {
                 }
                 if seg.header.is_ack {
                     // Bad; send back a RST
-                    let _seq = seg.header.ack;
+                    let conn = TcpConnection {
+                        dst_ip: seg.src_ip,
+                        dst_port: seg.header.src_port,
+                        src_port: seg.header.dst_port,
+                        src_ip: tcb.conn.src_ip,
+                    };
+                    // <SEQ=SEG.ACK><CTL=RST>
+                    tcb.send_buf.send_rst(&conn, tcb.recv_buf.rcv_wnd, seg.header.ack, 0, false);
+
                     return;
                 }
                 if seg.header.is_syn {
                     // Starting a new connection
 
-                    // Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ and any other
-                    // control or text should be queued for processing later.  ISS
-                    // should be selected and a SYN segment sent of the form:
+                    tcb.recv_buf.rcv_unc = u32::wrapping_add(seg.header.seq, 1);
+                    tcb.recv_buf.rcv_nxt = u32::wrapping_add(seg.header.seq, 1);
+                    tcb.recv_buf.irs = seg.header.seq;
+
+                    let iss = tcp_gen_seq();
+                    tcb.send_buf.iss = iss;
+                    tcb.send_buf.snd_una = iss;
+                    tcb.send_buf.snd_nxt = iss; // Will add one after send_syn()
+                    tcb.send_buf.snd_wl1 = iss;
+                    tcb.send_buf.snd_wl2 = iss;
 
                     // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
-
-                    // SND.NXT is set to ISS+1 and SND.UNA to ISS.  The connection
-                    // state should be changed to SYN-RECEIVED.  Note that any other
-                    // incoming control or data (combined with SYN) will be processed
-                    // in the SYN-RECEIVED state, but processing of SYN and ACK should
-                    // not be repeated.  If the listen was not fully specified (i.e.,
-                    // the foreign socket was not fully specified), then the
-                    // unspecified fields should be filled in now.
+                    tcb.send_buf.send_syn(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt,true); 
 
                     tcb.state = TcpState::SynReceived;
                     if tcb.conn.dst_ip.is_unspecified() {
@@ -513,21 +963,26 @@ pub mod tcp {
                 // it could not have been sent in response to anything sent by this
                 // incarnation of the connection.  So you are unlikely to get here,
                 // but if you do, drop the segment, and return.
+                return;
             },
             TcpState::SynSent => {
                 if seg.header.is_ack {
-                    // If SEG.ACK =< ISS, or SEG.ACK > SND.NXT, send a reset (unless
-                    // the RST bit is set, if so drop the segment and return)
-            
-                    //     <SEQ=SEG.ACK><CTL=RST>
-            
-                    // and discard the segment.  Return.
-            
+                    if i32::wrapping_sub(tcb.send_buf.iss as i32, seg.header.ack as i32) >= 0
+                        || i32::wrapping_sub(seg.header.ack as i32, tcb.send_buf.snd_nxt as i32) > 0 
+                    {
+                        if seg.header.is_rst {
+                            return;
+                        }
+                        // <SEQ=SEG.ACK><CTL=RST>
+                        tcb.send_buf.send_rst(&tcb.conn, tcb.recv_buf.rcv_wnd, seg.header.ack, 0, false);
+                        return;
+                    }
                     // If SND.UNA =< SEG.ACK =< SND.NXT then the ACK is acceptable.
                 }
                 if seg.header.is_rst {
-                    if seg.header.is_ack { // TODO?
+                    if seg.header.is_ack {
                         tcb.clear();
+                        TCBS[id].retry.notify_all();
                     }
                     return;
                 }
@@ -537,36 +992,35 @@ pub mod tcp {
                     // is an ACK), and any segments on the retransmission queue which
                     // are thereby acknowledged should be removed.
 
-                    // If SND.UNA > ISS (our SYN has been ACKed), change the connection
-                    // state to ESTABLISHED, form an ACK segment
+                    tcb.recv_buf.rcv_unc = u32::wrapping_add(seg.header.seq, 1);
+                    tcb.recv_buf.rcv_nxt = u32::wrapping_add(seg.header.seq, 1);
+                    tcb.recv_buf.irs = seg.header.seq;
 
-                    // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                    if seg.header.is_ack {
+                        let (syn_acked, _) = tcb.send_buf.ack(seg.header.ack);
+                        if syn_acked {
+                            // Established!
+                            assert!(i32::wrapping_sub(tcb.send_buf.snd_una as i32, tcb.send_buf.iss as i32) > 0);
+                            tcb.state = TcpState::Established;
+                            TCBS[id].retry.notify_all();
 
-                    // and send it.  Data or controls which were queued for
-                    // transmission may be included.  If there are other controls or
-                    // text in the segment then continue processing at the sixth step
-                    // below where the URG bit is checked, otherwise return.
+                            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                            tcb.send_buf.send_ack(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                        }
+                        else {
+                            // Simutaneous OPEN
+                            tcb.state = TcpState::SynReceived;
 
-                    // Otherwise enter SYN-RECEIVED, form a SYN,ACK segment
-
-                    // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
-
-                    // and send it.  If there are other controls or text in the
-                    // segment, queue them for processing after the ESTABLISHED state
-                    // has been reached, return.
+                            // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+                            tcb.send_buf.send_syn(&tcb.conn, 
+                                tcb.recv_buf.rcv_wnd, 
+                                tcb.recv_buf.rcv_nxt, true);
+                        }
+                    }
                 }
             }
             _ => {
                 // first check sequence number
-
-                // Segments are processed in sequence.  Initial tests on arrival
-                // are used to discard old duplicates, but further processing is
-                // done in SEG.SEQ order.  If a segment's contents straddle the
-                // boundary between old and new, only the new parts should be
-                // processed.
-
-                // There are four cases for the acceptability test for an incoming
-                // segment:
 
                 // Segment Receive  Test
                 // Length  Window
@@ -581,35 +1035,49 @@ pub mod tcp {
                 // >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
                 //             or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
 
-                // If the RCV.WND is zero, no segments will be acceptable, but
-                // special allowance should be made to accept valid ACKs, URGs and
-                // RSTs.
+                let seq_plus_len = u32::wrapping_add(seg.header.seq, seg.data.len() as u32);
+                let nxt_plus_wnd = u32::wrapping_add(tcb.recv_buf.rcv_nxt, tcb.recv_buf.rcv_wnd as u32);
+                let left = u32::saturating_sub(tcb.recv_buf.rcv_nxt, seg.header.seq) as usize;
+                let right = usize::saturating_sub(seg.data.len(), u32::saturating_sub(seq_plus_len, nxt_plus_wnd) as usize);
+                assert!(left <= right);
 
-                // If an incoming segment is not acceptable, an acknowledgment
-                // should be sent in reply (unless the RST bit is set, if so drop
-                // the segment and return):
+                let text_acceptable = right >= left;
+                // Tailor the segment text, so that it starts after RCV.NXT, and ends before RCV.NXT+RCV.WND
+                let seg_seq = u32::wrapping_add(seg.header.seq, left as u32);
+                let data = &mut seg.data[left..right];
+                
+                // If SND.UNA =< SEG.ACK =< SND.NXT then the ACK is acceptable.
+                // The ACK should then be accepted, even if the segment text is not.
+                let ack_acceptable = seg.header.is_ack
+                    && i32::wrapping_sub(seg.header.ack as i32, tcb.send_buf.snd_una as i32) >= 0
+                    && i32::wrapping_sub(tcb.send_buf.snd_nxt as i32, seg.header.ack as i32) >= 0;
 
-                // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                if !text_acceptable {
+                    // If an incoming segment is not acceptable, an acknowledgment
+                    // should be sent in reply (unless the RST bit is set, if so drop
+                    // the segment and return).
 
-                // After sending the acknowledgment, drop the unacceptable segment
-                // and return.
+                    // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                    tcb.send_buf.send_ack(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                    // TODO: alternatively, flush the send_buf and piggyback ACK
 
-                // In the following it is assumed that the segment is the idealized
-                // segment that begins at RCV.NXT and does not exceed the window.
-                // One could tailor actual segments to fit this assumption by
-                // trimming off any portions that lie outside the window (including
-                // SYN and FIN), and only processing further if the segment then
-                // begins at RCV.NXT.  Segments with higher begining sequence
-                // numbers may be held for later processing.
+                    if !ack_acceptable {
+                        return;
+                    }
+                }
+                
 
                 // second check the RST bit
                 if seg.header.is_rst {
+                    // Control bits are handled in order
+                    if seg_seq != tcb.recv_buf.rcv_nxt {
+                        return;
+                    }
                     match tcb.state {
                         TcpState::SynReceived => {
                             if tcb.passive {
                                 // Unwind to Listen
                                 tcb.state = TcpState::Listen;
-    
                             }
                             else {
                                 // Fail
@@ -620,7 +1088,7 @@ pub mod tcp {
                         },
                         TcpState::Established | TcpState::FinWait1 |
                         TcpState::FinWait2 | TcpState::CloseWait => {
-                            // TODO: flush all queues
+                            // TODO: flush send buffer
     
                             tcb.clear();
                             TCBS[id].retry.notify_all();
@@ -636,8 +1104,18 @@ pub mod tcp {
 
                 // third, check the SYN bit
                 if seg.header.is_syn {
+                    // Control bits are handled in order
+                    if seg_seq != tcb.recv_buf.rcv_nxt {
+                        return;
+                    }
+
                     // SYN in window, error
-                    // TODO: flush all queues
+                    tcb.send_buf.send_rst(&tcb.conn, 
+                        tcb.recv_buf.rcv_wnd, 
+                        tcb.send_buf.snd_nxt, 
+                        0, false);
+
+                    // TODO: flush send buffer
     
                     tcb.clear();
                     TCBS[id].retry.notify_all();
@@ -650,101 +1128,121 @@ pub mod tcp {
                     return;
                 }
                 else {
+                    if matches!(tcb.state, TcpState::SynReceived) {
+                        // If SND.UNA =< SEG.ACK =< SND.NXT then enter ESTABLISHED state
+                        // and continue processing.
+                        if ack_acceptable {
+                            tcb.state = TcpState::Established;
+                            TCBS[id].retry.notify_all();
+                        }
+                        else {
+                            // <SEQ=SEG.ACK><CTL=RST>
+                            tcb.send_buf.send_rst(&tcb.conn, 
+                                tcb.recv_buf.rcv_wnd, 
+                                seg.header.ack, 0, false);
+                            return;
+                        }
+                    }
                     match tcb.state {
-                        TcpState::SynReceived => {
-                            // If SND.UNA =< SEG.ACK =< SND.NXT then enter ESTABLISHED state
-                            // and continue processing.
-                  
-                            //   If the segment acknowledgment is not acceptable, form a
-                            //   reset segment,
-                  
-                            //     <SEQ=SEG.ACK><CTL=RST>
-                  
-                            //   and send it.
-                        },
+                        TcpState::SynReceived => unreachable!(),
                         TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 |
                         TcpState::CloseWait | TcpState::Closing => {
-                            // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
-                            // Any segments on the retransmission queue which are thereby
-                            // entirely acknowledged are removed.  Users should receive
-                            // positive acknowledgments for buffers which have been SENT and
-                            // fully acknowledged (i.e., SEND buffer should be returned with
-                            // "ok" response).  If the ACK is a duplicate
-                            // (SEG.ACK < SND.UNA), it can be ignored.  If the ACK acks
-                            // something not yet sent (SEG.ACK > SND.NXT) then send an ACK,
-                            // drop the segment, and return.
+                            if ack_acceptable {
+                                let (_, fin_acked) = tcb.send_buf.ack(seg.header.ack);
 
-                            // If SND.UNA < SEG.ACK =< SND.NXT, the send window should be
-                            // updated.  If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and
-                            // SND.WL2 =< SEG.ACK)), set SND.WND <- SEG.WND, set
-                            // SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
+                                // Update SND.WND
+                                let diff = i32::wrapping_sub(seg_seq as i32, tcb.send_buf.snd_wl1 as i32);
+                                // The check here prevents using old segments to update the window.
+                                if diff > 0 
+                                    || (diff == 0 && i32::wrapping_sub(seg.header.ack as i32, tcb.send_buf.snd_wl2 as i32) >= 0) 
+                                {
+                                    tcb.send_buf.snd_wnd = seg.header.wnd;
+                                    tcb.send_buf.snd_wl1 = seg_seq;
+                                    tcb.send_buf.snd_wl2 = seg.header.ack;
+                                }
 
-                            // Note that SND.WND is an offset from SND.UNA, that SND.WL1
-                            // records the sequence number of the last segment used to update
-                            // SND.WND, and that SND.WL2 records the acknowledgment number of
-                            // the last segment used to update SND.WND.  The check here
-                            // prevents using old segments to update the window.
-
-                            if matches!(tcb.state, TcpState::FinWait1) {
-                                // In addition to the processing for the ESTABLISHED state, if
-                                // our FIN is now acknowledged then enter FIN-WAIT-2 and continue
-                                // processing in that state.
+                                if matches!(tcb.state, TcpState::FinWait1) {
+                                    // In addition to the processing for the ESTABLISHED state, if
+                                    // our FIN is now acknowledged then enter FIN-WAIT-2 and continue
+                                    // processing in that state.
+                                    if fin_acked {
+                                        tcb.state = TcpState::FinWait2;
+                                    }
+                                }
+                                if matches!(tcb.state, TcpState::Closing) {
+                                    // In addition to the processing for the ESTABLISHED state, if
+                                    // the ACK acknowledges our FIN then enter the TIME-WAIT state,
+                                    // otherwise ignore the segment.
+                                    if fin_acked {
+                                        tcb.state = TcpState::TimeWait;
+                                    }
+                                }
                             }
-                            if matches!(tcb.state, TcpState::Closing) {
-                                // In addition to the processing for the ESTABLISHED state, if
-                                // the ACK acknowledges our FIN then enter the TIME-WAIT state,
-                                // otherwise ignore the segment.
+                            else if i32::wrapping_sub(tcb.send_buf.snd_nxt as i32, seg.header.ack as i32) < 0 {
+                                // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                                tcb.send_buf.send_ack(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                                // TODO: alternatively, flush the send_buf and piggyback ACK
+                                return;
                             }
+                            
                         },
                         TcpState::LastAck => {
                             // The only thing that can arrive in this state is an
                             // acknowledgment of our FIN.  If our FIN is now acknowledged,
                             // delete the TCB, enter the CLOSED state, and return.
+                            if ack_acceptable {
+                                let (_, fin_acked) = tcb.send_buf.ack(seg.header.ack);
+                                if fin_acked {
+                                    tcb.clear();
+                                }
+                            }
+                            return;
                         },
                         TcpState::TimeWait => {
                             // The only thing that can arrive in this state is a
                             // retransmission of the remote FIN.  Acknowledge it, and restart
                             // the 2 MSL timeout.
+                            if ack_acceptable {
+                                let (_, fin_acked) = tcb.send_buf.ack(seg.header.ack);
+                                if fin_acked {
+                                    // TODO: MSL timer
+                                }
+                            }
+                            return;
                         },
                         _ => unreachable!(),  
                     }
                 }
 
                 // fifth, process the segment text
-                match tcb.state {
-                    TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
-                        // Once in the ESTABLISHED state, it is possible to deliver segment
-                        // text to user RECEIVE buffers.  Text from segments can be moved
-                        // into buffers until either the buffer is full or the segment is
-                        // empty.  If the segment empties and carries an PUSH flag, then
-                        // the user is informed, when the buffer is returned, that a PUSH
-                        // has been received.
-
-                        // When the TCP takes responsibility for delivering the data to the
-                        // user it must also acknowledge the receipt of the data.
-
-                        // Once the TCP takes responsibility for the data it advances
-                        // RCV.NXT over the data accepted, and adjusts RCV.WND as
-                        // apporopriate to the current buffer availability.  The total of
-                        // RCV.NXT and RCV.WND should not be reduced.
-
-                        // Please note the window management suggestions in section 3.7.
-
-                        // Send an acknowledgment of the form:
-
-                        // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-
-                        // This acknowledgment should be piggybacked on a segment being
-                        // transmitted if possible without incurring undue delay.
-                    },
-                    _ => {
-                        // This should not occur, since a FIN has been received from the
-                        // remote side.  Ignore the segment text.
+                if data.len() > 0 {
+                    match tcb.state {
+                        TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
+                            // Put data into TcpRecvBuf
+                            // RCV.NXT and RCV.WND are adjusted accordingly.
+                            tcb.recv_buf.put(data, seg_seq);
+    
+                            // Send an acknowledgment of the form:
+                            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                            // This acknowledgment should be piggybacked on a segment being
+                            // transmitted if possible without incurring undue delay.
+    
+                            tcb.send_buf.send_ack(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                            // TODO: alternatively, flush the send_buf and piggyback ACK
+                        },
+                        _ => {
+                            // This should not occur, since a FIN has been received from the
+                            // remote side.  Ignore the segment text.
+                        }
                     }
                 }
-
+                
                 // sixth, check the FIN bit
                 if seg.header.is_fin {
+                    // Control bits are handled in order
+                    if seg_seq != tcb.recv_buf.rcv_nxt {
+                        return;
+                    }
                     if matches!(tcb.state, TcpState::Closed) 
                         || matches!(tcb.state, TcpState::Listen) 
                         || matches!(tcb.state, TcpState::SynSent) {
@@ -753,9 +1251,13 @@ pub mod tcp {
 
                     // If the FIN bit is set, signal the user "connection closing" and
                     // return any pending RECEIVEs with same message, advance RCV.NXT
-                    // over the FIN, and send an acknowledgment for the FIN.  Note that
-                    // FIN implies PUSH for any segment text not yet delivered to the
-                    // user.
+                    // over the FIN, and send an acknowledgment for the FIN. 
+
+                    tcb.recv_buf.rcv_nxt = u32::wrapping_add(tcb.recv_buf.rcv_nxt, 1);
+                    tcb.recv_buf.finned = true;
+
+                    tcb.send_buf.send_ack(&tcb.conn, tcb.recv_buf.rcv_wnd, tcb.recv_buf.rcv_nxt);
+                    
 
                     match tcb.state {
                         TcpState::SynReceived | TcpState::Established => {
@@ -764,20 +1266,24 @@ pub mod tcp {
                             return;
                         },
                         TcpState::FinWait1 => {
-                            // If our FIN has been ACKed (perhaps in this segment), then
-                            // enter TIME-WAIT, start the time-wait timer, turn off the other
-                            // timers; otherwise enter the CLOSING state.
+                            // ACKed FIN would be handled previously.
+                            // Just enter the CLOSING state.
+                            tcb.state = TcpState::Closing;
+                            return;
                         },
                         TcpState::FinWait2 => {
                             // Enter the TIME-WAIT state.  Start the time-wait timer, turn
                             // off the other timers.
+                            tcb.state = TcpState::TimeWait;
+                            // TODO: timer
+                            return;
                         },
                         TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {
                             // Remains state
                             return;
                         },
                         TcpState::TimeWait => {
-                            // Restart the 2 MSL time-wait timeout.
+                            // TODO: Restart the 2 MSL time-wait timeout.
                         },
                         _ => unreachable!(),
                     }
