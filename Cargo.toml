@@ -8,6 +8,10 @@ edition = "2021"
 [dependencies]
 rip = { path = "../rip" }
 libc = "0.2"
+array-macro = "2.1.5"
+lazy_static = "1.4.0"
+chrono = "0.4"
+flume = "0.10"
 
 [lib]
 name = "rtcp"

@@ -1,1 +1,11 @@
-gcc -o ./build/hello hello.c -L. -l:../target/debug/librtcp.so
+gcc -o ./build/hello hello.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -L. -l:../target/debug/librtcp.so
