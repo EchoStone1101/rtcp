@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 rip = { path = "../rip" }
 libc = "0.2"
+errno = "0.2.8"
 array-macro = "2.1.5"
 lazy_static = "1.4.0"
 chrono = "0.4"

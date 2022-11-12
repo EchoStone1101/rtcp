@@ -5,15 +5,18 @@ use libc::{sockaddr, addrinfo, socklen_t, size_t, ssize_t, c_char, c_void};
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
 use std::thread;
+use std::collections::HashMap;
 use std::sync::{Mutex, Arc, Condvar};
 use array_macro::*;
 use lazy_static::*;
 
 pub mod tcp_segment;
 pub mod tcp;
+pub mod posix;
 
 pub use tcp::tcp::*;
 pub use tcp_segment::tcp_segment::*;
+pub use posix::posix::*;
 
 /// This library, RTCP, implements basic TCP/IP (RFC 793) with flow control. 
 /// The TCP implementation is bare-bone, and might not support many features.
@@ -30,23 +33,36 @@ pub enum RtcpError {
     InvalidSegment(&'static str),
     /// Error during TCP state transition
     InvalidStateTransition(&'static str),
+    /// Error indicating abortion of TCP command
+    TCPCommandAbort,
     /// Error indicating a retry for TCP command
     TCPCommandRetry,
+    /// Error indicating unsupported POSIX functionalities
+    UnsupportedPOSIX,
+    /// Error indicating a failed POSIX emulation
+    FailedPOSIX,
 }
 
-/// The maximum fd for a RTCP socket.
-pub const MAX_SOCKET_FD: usize = 1024;
+/// Maximum socket count.
+pub const MAX_SOCKET_CNT: usize = 128;
 
 lazy_static! {
     /// Array of TCBs. Entry of None indicates the index is available
     /// for a new socket_fd.
-    pub static ref TCBS: [Arc<TCB>; MAX_SOCKET_FD] = array![
+    pub static ref TCBS: [Arc<TCB>; MAX_SOCKET_CNT] = array![
         Arc::new(TCB {
             inner: Mutex::new(None),
             retry: Condvar::new(),
-        }); MAX_SOCKET_FD];
+        }); MAX_SOCKET_CNT];
     
+    /// The underlying RIP control.
     pub static ref RIP: Arc<RipCtl> = Arc::new(RipCtl::init(true));
+
+    /// Mapping from FD to TCB id.
+    pub static ref FD2ID: Arc<Mutex<HashMap<Fd, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    
+    /// Mapping from TcpConnection to TCB id.
+    pub static ref TCT: Arc<Mutex<TcpConnTree>> = Arc::new(Mutex::new(TcpConnTree::new()));
 }
 
 
@@ -107,7 +123,7 @@ pub extern fn __wrap_socket(domain: i32, _type: i32, protocol: i32) -> i32 {
     eprintln!("socket(domain={}, type={}, protocol={})", domain, _type, protocol);
     
     // Demo, TCP create
-    tcp_create(10, RIP.tx.clone()).unwrap();
+    tcp_create(10, &mut TCBS[10].inner.lock().unwrap() ,RIP.tx.clone()).unwrap();
     10
 }
 
@@ -136,8 +152,8 @@ pub extern fn __wrap_connect(socket: i32, address: *const sockaddr, address_len:
 }
 
 #[no_mangle]
-pub extern fn __wrap_accept(socket: i32, address: *const sockaddr, address_len: socklen_t) -> i32 {
-    println!("accept(socket={}, address={:p}, address_len={})", socket, address, address_len);
+pub extern fn __wrap_accept(socket: i32, address: *mut sockaddr, address_len: *mut socklen_t) -> i32 {
+    println!("accept(socket={}, address={:p}, address_len={:p})", socket, address, address_len);
     0
 }
 

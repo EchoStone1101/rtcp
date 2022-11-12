@@ -19,19 +19,19 @@ pub mod tcp {
     #[allow(unused)]
     
     use rip::{RipPacket, Ipv4Packet, RipCtl};
-    use crate::{TCBS, MAX_SOCKET_FD, RtcpError, TCPHeader, TCPSegment};
-    use std::collections::{BinaryHeap, BTreeSet, VecDeque};
+    use crate::{TCBS, MAX_SOCKET_CNT, RtcpError, TCPHeader, TCPSegment};
+    use std::collections::{BinaryHeap, BTreeMap, VecDeque};
     use std::net::Ipv4Addr;
-    use std::sync::{Mutex, Condvar, Arc};
+    use std::sync::{Mutex, Condvar, MutexGuard};
     use std::thread;
     use std::time::Duration;
     use chrono::Utc;
 
     /// An unspecified port.
-    pub const UNSPECIFIED_PORT: u16 = 0;
+    pub const TCP_UNSPECIFIED_PORT: u16 = 0;
 
-    /// Global timeout for connections (abort if no ACKs), in ms.
-    pub const TCP_GLOBAL_TIMEOUT: usize = 5 * 60 * 1000;
+    /// The lowest ephemeral port.
+    pub const TCP_EPHEMERAL_PORT_LBOUND: u16 = 1025;
 
     /// TCP buffer size.
     pub const TCP_BUFFER_SZ: usize = 32768;
@@ -44,6 +44,18 @@ pub mod tcp {
 
     /// TCP minimal retransmission timeout, in ms.
     pub const TCP_MIN_RETX_TIMEOUT: u32 = 5;
+
+    /// TCP Maximum Segment Life, in ms.
+    /// For testing purposes, we set this to 5 seconds, which is
+    /// drastically shorter than it should be.
+    pub const TCP_MSL: u32 = 5_000;
+
+    /// TCP global timeout, in ms.
+    /// A TCP connection is aborted, if no segment is received on
+    /// the TCB for this period of time.
+    /// The normal practice is 5 minutes, which is also shortened for
+    /// testing proposes here.
+    pub const TCP_GLOBAL_TIMEOUT: u32 = 30_000;
 
     /// TCP maximal receiver segment queue size, for selective repeat.
     /// This constraint is picked only to defend against abnormal conditions.
@@ -90,21 +102,32 @@ pub mod tcp {
         /// Retransmission timer thread
         pub re_tx_thread: thread::JoinHandle<()>,
 
+        /// Global timeout / Time Wait thread
+        pub timeout_thread: thread::JoinHandle<()>,
+
+        /// The global timeout, either for abortion or closing (in
+        /// Time Wait state).
+        /// The name is picked in honor of God of War: Ragnarok, becasue
+        /// why not?
+        ragnarok: Option<u64>,
+
         /// An identifier of this TCB, for the proper termination
-        /// of the retransmission timer thread.
+        /// of the timer threads.
         nonce: u64,
+
+        /// Whether this TCB is finished.
+        finished: bool,
     }
 
     impl _TCB {
         /// Restore the TCB to a clean state, and CLOSED
         pub fn clear(&mut self) {
-            self.conn.src_ip = Ipv4Addr::UNSPECIFIED;
-            self.conn.dst_ip = Ipv4Addr::UNSPECIFIED;
-            self.conn.src_port = UNSPECIFIED_PORT;
-            self.conn.dst_port = UNSPECIFIED_PORT;
+            // Do not clear up `conn`: we need this information to
+            // clean up POSIX related stuff.
 
             self.state = TcpState::Closed;
             self.passive = false;
+            self.finished = true;
 
             // TODO: clear send_buf and recv_buf?
             
@@ -135,8 +158,9 @@ pub mod tcp {
         /// Retransmission queue.
         /// The actual data structure used is Search Tree with O(log(n)) look-up time.
         /// This is because we need to sort ReTxItem both by SEQ and timestamp.
-        pub re_tx_queue_by_seq: BTreeSet<SEQ>,
-        pub re_tx_queue_by_ts: BTreeSet<TS>,
+        pub re_tx_queue_by_seq: VecDeque<ReTxItem>,
+        pub re_tx_queue_by_seq_ofs: u64,
+        pub re_tx_queue_by_ts: BTreeMap<TS, u64>,
 
         /// Retransmission timeout in ms
         pub re_tx_timeout: u32,
@@ -146,63 +170,18 @@ pub mod tcp {
     }
 
     /// A segment in retransmission queue.
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct ReTxItem {
         pub start: u32,
         pub end: u32,
-        pub timestamp: u64,
         pub is_syn: bool,
         pub is_fin: bool,
     }
 
-    /// Sort by SEQ
-    #[derive(Debug)]
-    pub struct SEQ(Arc<ReTxItem>);
-    impl PartialEq for SEQ {
-        fn eq(&self, other: &Self) -> bool {
-            self.0.start == other.0.start
-        }
-    }
-    impl Eq for SEQ {}
-    impl PartialOrd for SEQ {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            let diff = i32::wrapping_sub(self.0.start as i32, other.0.start as i32);
-            if diff < 0 {
-                Some(std::cmp::Ordering::Less)
-            }
-            else if diff > 0 {
-                Some(std::cmp::Ordering::Greater)
-            }
-            else {
-                Some(std::cmp::Ordering::Equal)
-            }
-        }
-    }
-    impl Ord for SEQ {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.partial_cmp(other).unwrap()
-        }
-    }
-
-    /// Sort by timestamp
-    #[derive(Debug)]
-    pub struct TS(Arc<ReTxItem>);
-    impl PartialEq for TS {
-        fn eq(&self, other: &Self) -> bool {
-            self.0.timestamp == other.0.timestamp && self.0.start == other.0.start
-        }
-    }
-    impl Eq for TS {}
-    impl PartialOrd for TS {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            (self.0.timestamp, self.0.start).partial_cmp(&(other.0.timestamp, other.0.start))
-        }
-    }
-    impl Ord for TS {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.partial_cmp(other).unwrap()
-        }
-    }
+    /// Sort by timestamp (and the end SEQ, should timestamp collide).
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct TS(u64, u32);
+    
 
     impl TcpSendBuf {
         /// Put `data` into buffer, and register the segment 
@@ -240,15 +219,19 @@ pub mod tcp {
             // will panic as left > TCP_BUFFER_SZ. This is fine, though, since FIN is the
             // last possible message to be put into buffer.
             
-            let arc = Arc::new(ReTxItem {
+            let end = u32::wrapping_add(self.snd_nxt, virt_len);
+            let idx = self.re_tx_queue_by_seq.len();
+            let item = ReTxItem {
                 start: self.snd_nxt,
-                end: u32::wrapping_add(self.snd_nxt, virt_len),
-                timestamp: tcp_timestamp(),
+                end,
                 is_syn,
                 is_fin,
-            });
-            assert!(self.re_tx_queue_by_seq.insert(SEQ(arc.clone())));
-            assert!(self.re_tx_queue_by_ts.insert(TS(arc)));
+            };
+            self.re_tx_queue_by_seq.push_back(item);
+            assert!(self.re_tx_queue_by_ts.insert(
+                TS(tcp_timestamp(), end),
+                self.re_tx_queue_by_seq_ofs + idx as u64,
+            ).is_none());
 
             self.snd_nxt = u32::wrapping_add(self.snd_nxt, virt_len);
         }
@@ -390,8 +373,8 @@ pub mod tcp {
             let free = i32::wrapping_sub(
                 u32::wrapping_add(self.snd_una, self.snd_wnd as u32) as i32, 
                 self.snd_nxt as i32);
-            assert!(free >= 0);
-            if free == 0 {
+            // assert!(free >= 0);
+            if free <= 0 {
                 return Err(RtcpError::TCPCommandRetry);
             }
             let bytes_sent = std::cmp::min(free as usize, data.len());
@@ -438,7 +421,7 @@ pub mod tcp {
         }
 
         /// Retransmit a segment described by a ReTxItem, changing its timestamp.
-        pub fn retransmit(&mut self, conn: &TcpConnection, item: &mut ReTxItem, ack: u32, wnd: u16) {
+        pub fn retransmit(&mut self, conn: &TcpConnection, item: &ReTxItem, ack: u32, wnd: u16) {
             assert!(i32::wrapping_sub(item.start as i32, self.snd_una as i32) >= 0);
 
             let mut left = u32::wrapping_add(item.start, if item.is_syn {1} else {0}) as u16;
@@ -482,7 +465,7 @@ pub mod tcp {
                     &self.buf[left as usize..right as usize]
                 );
             }
-            item.timestamp = tcp_timestamp();
+            // item.timestamp = tcp_timestamp();
             // println!("{:?}", conn);
             // eprintln!("[RETX] {}-{}", item.start, item.end);
 
@@ -495,37 +478,24 @@ pub mod tcp {
             let mut fin_acked = false;
             
             while !self.re_tx_queue_by_seq.is_empty() {
-                // This is dumb because Rust treats BTreeSet::first() as unstable...
-                // Not sure if this is inefficient...
-                let item = self.re_tx_queue_by_seq.iter().next().unwrap();
 
-                if i32::wrapping_sub(ack as i32, item.0.start as i32) < 0 {
+                let item = self.re_tx_queue_by_seq.front_mut().unwrap();
+
+                if i32::wrapping_sub(ack as i32, item.start as i32) < 0 {
                     break;
                 }
-                if i32::wrapping_sub(ack as i32, item.0.end as i32) >= 0 {
-                    if item.0.is_syn {
+                if i32::wrapping_sub(ack as i32, item.end as i32) >= 0 {
+                    if item.is_syn {
                         syn_acked = true;
                     }
-                    if item.0.is_fin {
+                    if item.is_fin {
                         fin_acked = true;
                     }
-                    let dummy = item.0.clone();
-                    assert!(self.re_tx_queue_by_seq.remove(&SEQ(dummy.clone())));
-                    assert!(self.re_tx_queue_by_ts.remove(&TS(dummy)));
+                    _ = self.re_tx_queue_by_seq.pop_front();
+                    self.re_tx_queue_by_seq_ofs += 1;
                 }
                 else {
-                    let mut dummy = item.0.clone();
-                    drop(item);
-
-                    assert!(self.re_tx_queue_by_seq.remove(&SEQ(dummy.clone())));
-                    assert!(self.re_tx_queue_by_ts.remove(&TS(dummy.clone())));
-                    let item = Arc::get_mut(&mut dummy).unwrap(); // We should be the only owner now
-                    
                     item.start = ack;
-                    
-                    self.re_tx_queue_by_seq.insert(SEQ(dummy.clone()));
-                    self.re_tx_queue_by_ts.insert(TS(dummy));
-
                     break;
                 }
             }
@@ -588,7 +558,6 @@ pub mod tcp {
             // Make sure we do not overwrite buffer
             assert!(u64::wrapping_add(self.rcv_unc as u64, TCP_BUFFER_SZ as u64) >= u64::wrapping_add(self.rcv_nxt as u64, self.rcv_wnd as u64));
 
-
             let queue = &mut self.seg_queue;
             if queue.len() >= TCP_MAX_SEGQUEUE_SZ {
                 return (false, false);
@@ -607,49 +576,10 @@ pub mod tcp {
                 self.buf[left as usize..right as usize].copy_from_slice(data);
             }
 
-            // Manipulate `seg_queue`; insert and coalesce this segment.
-            // let queue = &mut self.seg_queue;
-            // let mut split_idx: usize = 0;
-            // for (idx, item) in queue.iter().enumerate() {
-            //     split_idx = idx;
-            //     if i32::wrapping_sub(item.end as i32, seg_seq as i32) >= 0 {
-            //         break;
-            //     }
-            // }
-            // let mut part = queue.split_off(split_idx);
-            // let mut new_end = u32::wrapping_add(seg_seq, data.len() as u32);
-            // let mut new_start = seg_seq;
-            // while !part.is_empty() {
-            //     let &SegItem { start, end} = part.front().unwrap();
-
-            //     if i32::wrapping_sub(start as i32, new_end as i32) <= 0 {
-            //         _ = part.pop_front().unwrap();
-            //         if i32::wrapping_sub(new_start as i32, start as i32) > 0 {
-            //             new_start = start;
-            //         }
-            //         if i32::wrapping_sub(end as i32, new_end as i32) > 0 {
-            //             new_end = end;
-            //         }
-            //     }
-            //     else {
-            //         break;
-            //     }
-            // }
-            // part.push_front(SegItem {start: new_start, end: new_end});
-            // self.seg_queue.append(&mut part);
-
-            // Check if we can move RCV.NXT
-            // let &SegItem{start, end} = self.seg_queue.front().unwrap();
-            // if start == self.rcv_nxt {
-            //     _ = self.seg_queue.pop_front().unwrap();
-            //     self.rcv_nxt = end;
-            //     self.rcv_wnd = u16::checked_sub(self.rcv_wnd, u32::wrapping_sub(end, start) as u16).unwrap();
-            // }
-
             // Manipulate `seg_queue`: insert the segment, delay the coalescing.
             queue.push(SegItem {start: seg_seq, end: u32::wrapping_add(seg_seq, data.len() as u32)});
 
-            // if queue.len() > 100 {
+            // if queue.len() > 20 {
             //     while !queue.is_empty() {
             //         println!("{:?}", queue.pop().unwrap());
             //     }
@@ -657,19 +587,25 @@ pub mod tcp {
             // }
 
             // Check if we can move RCV.NXT
+            // println!("rcv_nxt: {}, seg_seq: {}", self.rcv_nxt, seg_seq);
+
             let &SegItem{start, end} = queue.peek().unwrap();
             let mut rcv_nxt_moved = false;
             if start == self.rcv_nxt {
                 // Coalesce now
                 let mut new_rcv_nxt = end;
                 while !queue.is_empty() {
-                    let SegItem{start, end} = queue.pop().unwrap();
+                    let &SegItem{start, end} = queue.peek().unwrap();
+                    // println!("> {}, {}, {}", new_rcv_nxt, start, end);
+
                     if i32::wrapping_sub(new_rcv_nxt as i32, start as i32) < 0 {
                         break;
                     }
+                    _ = queue.pop().unwrap();
 
                     if i32::wrapping_sub(end as i32, new_rcv_nxt as i32) > 0 {
                         new_rcv_nxt = end;
+                        
                     }
                 }
                 rcv_nxt_moved = i32::wrapping_sub(new_rcv_nxt as i32, self.rcv_nxt as i32) > 0;
@@ -766,10 +702,13 @@ pub mod tcp {
 
     impl TcpConnection {
         pub fn dst_sock_unspecified(&self) -> bool {
-            self.dst_ip.is_unspecified() || self.dst_port == UNSPECIFIED_PORT
+            self.dst_ip.is_unspecified() || self.dst_port == TCP_UNSPECIFIED_PORT
+        }
+
+        pub fn src_sock_unspecified(&self) -> bool {
+            self.src_ip.is_unspecified() && self.src_port == TCP_UNSPECIFIED_PORT
         }
     }
-
 
     /// The states in a TCP state machine.
     #[derive(Debug, Clone, Copy)]
@@ -788,7 +727,7 @@ pub mod tcp {
     }
 
     /// Generate timestamp for use in TCP. 
-    fn tcp_timestamp() -> u64 {
+    pub fn tcp_timestamp() -> u64 {
         Utc::now().timestamp_micros() as u64
     }
 
@@ -798,17 +737,18 @@ pub mod tcp {
         (tcp_timestamp() as u32)>>2
     }
 
+
     /// TCP STATUS command.
     pub fn tcp_status(id: usize) -> TcpState {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
 
         let guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
 
-        let send_buf = &guard.as_ref().unwrap().send_buf;
-        eprintln!("iss:{}, una:{}, nxt:{}, wnd:{}", send_buf.iss, send_buf.snd_una, send_buf.snd_nxt, send_buf.snd_wnd);
-        let recv_buf = &guard.as_ref().unwrap().recv_buf;
-        eprintln!("irs:{}, unc:{}, nxt:{}, wnd:{}", recv_buf.irs, recv_buf.rcv_unc, recv_buf.rcv_nxt, recv_buf.rcv_wnd);
+        // let send_buf = &guard.as_ref().unwrap().send_buf;
+        // eprintln!("iss:{}, una:{}, nxt:{}, wnd:{}", send_buf.iss, send_buf.snd_una, send_buf.snd_nxt, send_buf.snd_wnd);
+        // let recv_buf = &guard.as_ref().unwrap().recv_buf;
+        // eprintln!("irs:{}, unc:{}, nxt:{}, wnd:{}", recv_buf.irs, recv_buf.rcv_unc, recv_buf.rcv_nxt, recv_buf.rcv_wnd);
 
         guard.as_ref().unwrap().state
     }
@@ -819,20 +759,19 @@ pub mod tcp {
     /// and OPEN acts on a given TCB just like any other TCP command.
     pub fn tcp_create(
         id: usize, 
+        guard: &mut MutexGuard<Option<_TCB>>,
         tx: flume::Sender<RipPacket>) 
         -> Result<(), RtcpError>
     {
-        assert!(id < MAX_SOCKET_FD);
-
-        let mut guard = TCBS[id].inner.lock().unwrap();
+        assert!(id < MAX_SOCKET_CNT);
         assert!(guard.is_none());
         let nonce = tcp_timestamp();
         _ = guard.insert(_TCB {
             conn: TcpConnection { 
                 src_ip: Ipv4Addr::UNSPECIFIED, 
-                src_port: UNSPECIFIED_PORT, 
+                src_port: TCP_UNSPECIFIED_PORT, 
                 dst_ip: Ipv4Addr::UNSPECIFIED, 
-                dst_port: UNSPECIFIED_PORT
+                dst_port: TCP_UNSPECIFIED_PORT
             },
             state: TcpState::Closed,
             passive: false,
@@ -844,8 +783,9 @@ pub mod tcp {
                 snd_wl1: 0,
                 snd_wl2: 0,
                 iss: 0,
-                re_tx_queue_by_seq: BTreeSet::new(),
-                re_tx_queue_by_ts: BTreeSet::new(),
+                re_tx_queue_by_seq: VecDeque::new(),
+                re_tx_queue_by_seq_ofs: 0,
+                re_tx_queue_by_ts: BTreeMap::new(),
                 re_tx_timeout: TCP_DFT_RETX_TIMEOUT,
                 tx,
             },
@@ -872,29 +812,43 @@ pub mod tcp {
                     }
 
                     // One round of retransmission
-                    // let now = tcp_timestamp();
                     let tcb = guard.as_mut().unwrap();
+                    if matches!(tcb.state, TcpState::Closed) {
+                        if tcb.finished {
+                            break;
+                        }
+                        _ = TCBS[id].retry.wait(guard);
+                        continue;
+                    }
+                    if matches!(tcb.state, TcpState::TimeWait) {
+                        // No longer retransmit in TimeWait
+                        break;
+                    }
 
                     let mut wakeup = None;
 
                     while !tcb.send_buf.re_tx_queue_by_ts.is_empty() {
-                        let item = tcb.send_buf.re_tx_queue_by_ts.iter().next().unwrap();
+                        let (&TS(ts, end), &idx) = tcb.send_buf.re_tx_queue_by_ts.iter().next().unwrap();
+
+                        if idx < tcb.send_buf.re_tx_queue_by_seq_ofs {
+                            // The SegItem is already acked, skip
+                            assert!(tcb.send_buf.re_tx_queue_by_ts.remove(&TS(ts, end)).is_some());
+                            continue
+                        }
                         
-                        if item.0.timestamp + (tcb.send_buf.re_tx_timeout * 1000) as u64 <= tcp_timestamp() {
-                            let mut dummy = item.0.clone();
-                            assert!(tcb.send_buf.re_tx_queue_by_ts.remove(&TS(dummy.clone())));
-                            assert!(tcb.send_buf.re_tx_queue_by_seq.remove(&SEQ(dummy.clone())));
+                        if ts + (tcb.send_buf.re_tx_timeout * 1000) as u64 <= tcp_timestamp() {
+                            
+                            assert!(tcb.send_buf.re_tx_queue_by_ts.remove(&TS(ts, end)).is_some());
 
                             // Retransmit
-                            let item = Arc::get_mut(&mut dummy).unwrap();
-                            tcb.send_buf.retransmit(&tcb.conn, item, tcb.recv_buf.rcv_nxt, tcb.recv_buf.rcv_wnd);
-                            drop(item);
+                            let real_idx = (idx - tcb.send_buf.re_tx_queue_by_seq_ofs) as usize;
+                            let item = tcb.send_buf.re_tx_queue_by_seq[real_idx];
+                            tcb.send_buf.retransmit(&tcb.conn, &item, tcb.recv_buf.rcv_nxt, tcb.recv_buf.rcv_wnd);
 
-                            tcb.send_buf.re_tx_queue_by_seq.insert(SEQ(dummy.clone()));
-                            tcb.send_buf.re_tx_queue_by_ts.insert(TS(dummy));
+                            tcb.send_buf.re_tx_queue_by_ts.insert(TS(tcp_timestamp(), end), idx);
                         }
                         else {
-                            wakeup = Some(item.0.timestamp + (tcb.send_buf.re_tx_timeout * 1000) as u64);
+                            wakeup = Some(ts + (tcb.send_buf.re_tx_timeout * 1000) as u64);
                             break;
                         }
                     }
@@ -924,7 +878,59 @@ pub mod tcp {
                     // thread::sleep(Duration::from_millis(100000000));
                 }
             }),
+            ragnarok: None,
+            // Start the timeout thread 
+            timeout_thread: thread::spawn(move|| {
+                let my_nonce = nonce;
+
+                loop {
+                    let mut guard = TCBS[id].inner.lock().unwrap();
+                    if guard.is_none() || my_nonce != guard.as_ref().unwrap().nonce {
+                        // TCB has been deleted, or is now a new incarnation.
+                        // Terminate.
+                        drop(guard);
+                        break;
+                    }
+
+                    let tcb = guard.as_mut().unwrap();
+                    if matches!(tcb.state, TcpState::Closed) {
+                        if tcb.finished {
+                            break;
+                        }
+                        _ = TCBS[id].retry.wait(guard);
+                        continue;
+                    }
+
+                    let now = tcp_timestamp();
+
+                    if tcb.ragnarok.is_none() {
+                        // Starting global timeout 
+                        tcb.ragnarok = Some(now + (TCP_GLOBAL_TIMEOUT * 1000) as u64);
+                    }
+
+                    let ragnarok = tcb.ragnarok.unwrap();
+                    if now < ragnarok {
+                        drop(guard);
+                        thread::sleep(Duration::from_micros(ragnarok - now));
+                    }
+                    else {
+                        // Timeout!
+                        if matches!(tcb.state, TcpState::TimeWait) {
+                            tcb.clear();
+                            // eprintln!("time wait done!");
+                            break;
+                        }
+                        else {
+                            tcp_abort(id, &mut guard).unwrap();
+                            eprintln!("[RTCP] Abort {} due to timeout", id);
+                            break;
+                        }
+                    }
+                }
+
+            }),
             nonce,
+            finished: false,
         });
 
 
@@ -939,7 +945,7 @@ pub mod tcp {
         dst_port: u16,
         passive: bool) -> Result<(), RtcpError>
     {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
 
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
@@ -953,6 +959,7 @@ pub mod tcp {
                 if passive {
                     tcb.passive = passive;
                     tcb.state = TcpState::Listen;
+                    TCBS[id].retry.notify_all();
                     Ok(())
                 }
                 else {
@@ -971,7 +978,7 @@ pub mod tcp {
                     send_buf.snd_wl2 = iss;
                     
                     send_buf.send_syn(&tcb.conn, tcb.recv_buf.rcv_wnd, 0, false); // <SEQ=ISS><CTL=SYN>
-                    
+                    TCBS[id].retry.notify_all();
                     Ok(())
                 }
                 
@@ -989,12 +996,13 @@ pub mod tcp {
     /// TCP SEND command. Can be queued and retried.
     pub fn tcp_send(
         id: usize,
-        _buf: &[u8],
+        buf: &[u8],
         _push: bool,
         _urgent: bool) -> Result<usize, RtcpError>
     {
         loop {
-            match tcp_send_once(id, _buf, _push, _urgent) {
+            let mut nonce = None;
+            match tcp_send_once(id, buf, &mut nonce) {
                 Err(e) if matches!(e, RtcpError::TCPCommandRetry) => {},
                 Err(e) => return Err(e),
                 Ok(cnt) => return Ok(cnt),
@@ -1003,16 +1011,23 @@ pub mod tcp {
     }
 
     /// TCP SEND internal.
-    fn tcp_send_once(
+    pub fn tcp_send_once(
         id: usize,
         buf: &[u8],
-        _push: bool,
-        _urgent: bool) -> Result<usize, RtcpError>
+        nonce: &mut Option<u64>) -> Result<usize, RtcpError>
     {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
         let tcb = guard.as_mut().unwrap();
+        if nonce.is_none() {
+            _ = nonce.insert(tcb.nonce);
+        }
+        else {
+            if tcb.nonce.ne(nonce.as_ref().unwrap()) {
+                return Err(RtcpError::TCPCommandAbort);
+            }
+        }
 
         match tcb.state {
             TcpState::Closed => {
@@ -1050,12 +1065,13 @@ pub mod tcp {
     /// TCP RECEIVE command
     pub fn tcp_recv(
         id: usize,
-        _buf: &mut [u8],
+        buf: &mut [u8],
         _push: bool,
         _urgent: bool) -> Result<usize, RtcpError> 
     {
         loop {
-            match tcp_recv_once(id, _buf, _push, _urgent) {
+            let mut nonce = None;
+            match tcp_recv_once(id, buf, &mut nonce) {
                 Err(e) if matches!(e, RtcpError::TCPCommandRetry) => {},
                 Err(e) => return Err(e),
                 Ok(cnt) => return Ok(cnt),
@@ -1064,16 +1080,23 @@ pub mod tcp {
     }
 
     /// TCP RECEIVE internal
-    fn tcp_recv_once(
+    pub fn tcp_recv_once(
         id: usize,
         buf: &mut [u8],
-        _push: bool,
-        _urgent: bool) -> Result<usize, RtcpError> 
+        nonce: &mut Option<u64>) -> Result<usize, RtcpError> 
     {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
         let tcb = guard.as_mut().unwrap();
+        if nonce.is_none() {
+            _ = nonce.insert(tcb.nonce);
+        }
+        else {
+            if tcb.nonce.ne(nonce.as_ref().unwrap()) {
+                return Err(RtcpError::TCPCommandAbort);
+            }
+        }
 
         match tcb.state {
             TcpState::Closed => {
@@ -1127,7 +1150,7 @@ pub mod tcp {
     /// other thread calls CLOSE, then the SEND will fail).
     /// However, we do guarantee that returned SENDs must succeed.
     pub fn tcp_close(id: usize) -> Result<(), RtcpError> {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
         let mut tcb = guard.as_mut().unwrap();
@@ -1182,10 +1205,10 @@ pub mod tcp {
     }
 
     /// TCP ABORT command.
-    pub fn tcp_abort(id: usize) -> Result<(), RtcpError> {
-        assert!(id < MAX_SOCKET_FD);
-        let mut guard = TCBS[id].inner.lock().unwrap();
-        assert!(!guard.is_none());
+    pub fn tcp_abort(id: usize, guard: &mut MutexGuard<Option<_TCB>>) -> Result<(), RtcpError> {
+        assert!(id < MAX_SOCKET_CNT);
+        // let mut guard = TCBS[id].inner.lock().unwrap();
+        // assert!(!guard.is_none());
         let tcb = guard.as_mut().unwrap();
 
         match tcb.state {
@@ -1225,10 +1248,17 @@ pub mod tcp {
         id: usize,
         mut seg: TCPSegment,
     ) {
-        assert!(id < MAX_SOCKET_FD);
+        assert!(id < MAX_SOCKET_CNT);
         let mut guard = TCBS[id].inner.lock().unwrap();
         assert!(!guard.is_none());
         let tcb = guard.as_mut().unwrap();
+
+        // Refresh global timeout
+        if !matches!(tcb.state, TcpState::TimeWait) && !matches!(tcb.state, TcpState::Closed) {
+            if tcb.ragnarok.is_some() {
+                tcb.ragnarok = Some(tcp_timestamp() + (TCP_GLOBAL_TIMEOUT * 1000) as u64);
+            }
+        }
 
         match tcb.state {
             TcpState::Closed => {
@@ -1565,7 +1595,8 @@ pub mod tcp {
                             if ack_acceptable {
                                 let (_, fin_acked, _) = tcb.send_buf.ack(seg.header.ack);
                                 if fin_acked {
-                                    // TODO: MSL timer
+                                    // MSL timer
+                                    tcb.ragnarok = Some(tcp_timestamp() + 2 * TCP_MSL as u64);
                                 }
                             }
                             return;
@@ -1644,7 +1675,7 @@ pub mod tcp {
                             // Enter the TIME-WAIT state.  Start the time-wait timer, turn
                             // off the other timers.
                             tcb.state = TcpState::TimeWait;
-                            // TODO: timer
+                            tcb.ragnarok = Some(tcp_timestamp() + 2 * 1000 * TCP_MSL as u64);
                             return;
                         },
                         TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {
@@ -1652,7 +1683,8 @@ pub mod tcp {
                             return;
                         },
                         TcpState::TimeWait => {
-                            // TODO: Restart the 2 MSL time-wait timeout.
+                            // Restart the 2 MSL time-wait timeout.
+                            tcb.ragnarok = Some(tcp_timestamp() + 2 * 1000 * TCP_MSL as u64);
                         },
                         _ => unreachable!(),
                     }
