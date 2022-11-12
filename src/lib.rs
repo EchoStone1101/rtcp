@@ -73,14 +73,25 @@ pub extern fn __rtcp_init() {
             assert!(right >= left);
             let data = Vec::from(&ip_packet.data[left..right]);
 
-            println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, data);
+            // if header.is_fin {
+            //     println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, &data[..std::cmp::min(data.len(), 20)]);
+            // }
+
+            // println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, &data[..std::cmp::min(data.len(), 20)]);
+            
             tcp_seg_arrive(10, TCPSegment {
                 header,
                 src_ip: ip_packet.hdr.src_ip,
                 data,
             });
 
-            println!("[Status] {:?}\n===========================", tcp_status(10));
+            // println!("[Status] {:?}\n===========================", tcp_status(10));
+            
+
+            // if header.is_fin {
+            //     println!("[Status] {:?}\n===========================", tcp_status(10));
+            // }
+
         }
     });
 
@@ -131,26 +142,30 @@ pub extern fn __wrap_accept(socket: i32, address: *const sockaddr, address_len: 
 }
 
 #[no_mangle]
+#[allow(unused)]
 pub extern fn __wrap_recv(socket: i32, buffer: *mut c_void, length: size_t, flags: i32) -> ssize_t {
-    eprintln!("recv(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
+    // eprintln!("recv(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
 
     // Demo, TCP RECV
-    let mut buf = [0u8; 20];
-    println!("[RECV] {:?}", tcp_recv(10, &mut buf, false, false));
-    println!("buf: {:?}", buf);
-    println!("[Status] {:?}\n===========================", tcp_status(10));
-    0
+    let mut buf = [0u8; 28000]; 
+    let res = tcp_recv(10, &mut buf, false, false);
+    // println!("[RECV] {:?}", res);
+    // println!("buf: {:?}", &buf[..20]);
+    // println!("[Status] {:?}\n===========================", tcp_status(10));
+    res.unwrap_or(0) as ssize_t
 }
 
 #[no_mangle]
+#[allow(unused)]
 pub extern fn __wrap_send(socket: i32, buffer: *const c_void, length: size_t, flags: i32) -> ssize_t {
-    eprintln!("send(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
+    // eprintln!("send(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
 
     // Demo, TCP SEND
-    let buf = 0xdeadbeef_u32.to_be_bytes();
-    println!("[SNED] {:?}", tcp_send(10, &buf, false, false));
-    println!("[Status] {:?}\n===========================", tcp_status(10));
-    0
+    let buf = [0xccu8; 28000]; 
+    let res = tcp_send(10, &buf, false, false);
+    // println!("[SEND] {:?}", res);
+    // println!("[Status] {:?}\n===========================", tcp_status(10));
+    res.unwrap_or(0) as ssize_t
 }
 
 #[no_mangle]

@@ -37,3 +37,61 @@ gcc -o ./build/passive passive.c \
     -Wl,--wrap,send \
     -Wl,--wrap,recv \
     -L/home/echostone/桌面/CompNet/rtcp/target/debug -lrtcp
+
+gcc -o ./build/sender sender.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/debug -lrtcp
+
+gcc -o ./build/receiver receiver.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/debug -lrtcp
+
+
+
+gcc -o ./build/sender sender.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/release -lrtcp
+
+gcc -o ./build/receiver receiver.c \
+    -Wl,--wrap,socket \
+    -Wl,--wrap,bind \
+    -Wl,--wrap,listen \
+    -Wl,--wrap,connect \
+    -Wl,--wrap,accept \
+    -Wl,--wrap,read \
+    -Wl,--wrap,write \
+    -Wl,--wrap,close \
+    -Wl,--wrap,getaddrinfo \
+    -Wl,--wrap,send \
+    -Wl,--wrap,recv \
+    -L/home/echostone/桌面/CompNet/rtcp/target/release -lrtcp

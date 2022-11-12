@@ -10,7 +10,8 @@ int main() {
     sleep(5); // Wait for RIP
     connect(10, NULL, 0);
     send(10, NULL, 0, 0); // Can send immediately
-    sleep(10);
+    send(10, NULL, 0, 0); // ...twice
+    sleep(6);
     close(10);
 
     while(1);
