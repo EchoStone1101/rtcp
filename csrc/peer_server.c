@@ -14,8 +14,6 @@ struct timeval start, end;
 
 int main() {
 
-    // sleep(5); should not need this now
-
     int sock = socket(AF_INET, SOCK_STREAM, 0);
 
     struct sockaddr_in addr;
@@ -24,12 +22,17 @@ int main() {
     addr.sin_addr.s_addr = htonl(0x0a640101);
     addr.sin_port = 5678;
 
-    // without bind(); RTCP should pick appropriate (src_ip, src_port)
-    
+    if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 0;
+    }
+
+    addr.sin_addr.s_addr = htonl(0x0a640102);
     if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("connect");
         return 0;
     }
+
 
 
     ssize_t sent = 0;
@@ -92,6 +95,8 @@ int main() {
     double elapsed = ((end.tv_sec  - start.tv_sec) * 1000000u +
                     end.tv_usec - start.tv_usec) / 1.e6;
     printf("======================\n[Sent] %ld \nElapsed: %lf\n======================\n", sent, elapsed);
+
+
 
 
     if (close(sock) < 0) {

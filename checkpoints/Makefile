@@ -5,7 +5,7 @@
 
 
 
-all: echo_client echo_server
+all: echo_client echo_server perf_client perf_server
 %: %.c
 	gcc -o $@ $^ unp.c ../csrc/rtcp.c \
 		-Wl,--wrap,socket \

@@ -5,35 +5,31 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/time.h>
+#include <errno.h>
 #include <stdlib.h>
+struct timeval start, end;
 
-/// Passive open
+/// Use POSIX like interface
 
 int main() {
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("sock");
-    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = htonl(0x0a640102);
     addr.sin_port = 5678;
 
     if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
+        return 0;
     }
 
-    if (listen(sock, 4) < 0) {
-        perror("listen");
-    }
-
-    
-    int connfd = accept(sock, NULL, NULL);
-    if (connfd < 0) {
-        perror("accept");
+    addr.sin_addr.s_addr = htonl(0x0a640101);
+    if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
         return 0;
     }
 
@@ -41,13 +37,12 @@ int main() {
     void *data = malloc(tot);
 
     ssize_t rcvd = 0, _rcvd;
-    while ((_rcvd = read(connfd, data + rcvd, tot - rcvd)) > 0) {
+    while ((_rcvd = read(sock, data + rcvd, tot - rcvd)) > 0) {
         rcvd += _rcvd;
     }
     printf("======================\n[Received] %ld\n======================\n", rcvd);
 
-    
-    if (close(connfd) < 0) {
+    if (close(sock) < 0) {
         perror("close");
     }
 

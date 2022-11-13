@@ -22,7 +22,7 @@ pub mod posix {
     /// use id and TCB. 
     #[derive(Debug, Clone, Copy)]
     pub struct Fd {
-        fd: i32,
+        pub fd: i32,
         _non_block: bool,
     }
     impl PartialEq for Fd {

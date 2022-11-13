@@ -34,10 +34,10 @@ pub mod tcp_segment {
             if buf.len() < 20 {
                 return Err(RtcpError::BufError("buffer too small"));
             }
-            if buf[12] & 0b11110000 != 0 || buf[13] & 0b11 != 0 {
+            if buf[12] & 0b1111 != 0 || buf[13] & 0b11000000 != 0 {
                 return Err(RtcpError::InvalidSegment("reserved bits non zero"));
             }
-            let data_ofs = buf[12] & 0b1111;
+            let data_ofs = buf[12] >> 4;
             if (data_ofs * 4) as usize > buf.len() {
                 return Err(RtcpError::InvalidSegment("header too small"));
             }
@@ -47,12 +47,12 @@ pub mod tcp_segment {
             let seq = u32::from_be_bytes(buf[4..8].try_into().unwrap());
             let ack = u32::from_be_bytes(buf[8..12].try_into().unwrap());
             
-            let is_urg = buf[13] & 0b100 != 0;
-            let is_ack = buf[13] & 0b1000 != 0;
-            let is_psh = buf[13] & 0b10000 != 0;
-            let is_rst = buf[13] & 0b100000 != 0;
-            let is_syn = buf[13] & 0b1000000 != 0;
-            let is_fin = buf[13] & 0b10000000 != 0;
+            let is_urg = buf[13] & 0b100000 != 0;
+            let is_ack = buf[13] & 0b10000 != 0;
+            let is_psh = buf[13] & 0b1000 != 0;
+            let is_rst = buf[13] & 0b100 != 0;
+            let is_syn = buf[13] & 0b10 != 0;
+            let is_fin = buf[13] & 0b1 != 0;
             let wnd = u16::from_be_bytes(buf[14..16].try_into().unwrap());
             let checksum = u16::from_be_bytes(buf[16..18].try_into().unwrap());
             let urg_ptr = u16::from_be_bytes(buf[18..20].try_into().unwrap());
@@ -86,15 +86,15 @@ pub mod tcp_segment {
             buf[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
             buf[4..8].copy_from_slice(&self.seq.to_be_bytes());
             buf[8..12].copy_from_slice(&self.ack.to_be_bytes());
-            buf[12] = self.data_ofs & 0b1111;
+            buf[12] = (self.data_ofs & 0b1111) << 4;
 
             buf[13] = 0;
-            buf[13] |= if self.is_urg {0b100} else {0};
-            buf[13] |= if self.is_ack {0b1000} else {0};
-            buf[13] |= if self.is_psh {0b10000} else {0};
-            buf[13] |= if self.is_rst {0b100000} else {0};
-            buf[13] |= if self.is_syn {0b1000000} else {0};
-            buf[13] |= if self.is_fin {0b10000000} else {0};
+            buf[13] |= if self.is_urg {0b100000} else {0};
+            buf[13] |= if self.is_ack {0b10000} else {0};
+            buf[13] |= if self.is_psh {0b1000} else {0};
+            buf[13] |= if self.is_rst {0b100} else {0};
+            buf[13] |= if self.is_syn {0b10} else {0};
+            buf[13] |= if self.is_fin {0b1} else {0};
 
             buf[14..16].copy_from_slice(&self.wnd.to_be_bytes());
             buf[16..18].copy_from_slice(&self.checksum.to_be_bytes());

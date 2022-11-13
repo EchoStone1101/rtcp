@@ -2,7 +2,6 @@
 
 use rip::{RipCtl, RipError, Ipv4Packet};
 use libc::{sockaddr, addrinfo, socklen_t, size_t, ssize_t, c_char, c_void};
-use std::ffi::CStr;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::collections::HashMap;
@@ -71,6 +70,7 @@ lazy_static! {
 
 
 #[no_mangle]
+/// Initialize RTCP library, starting the main dispatch thread.
 pub extern fn __rtcp_init() {
     eprintln!("[RTCP] Initializing");
 
@@ -122,6 +122,51 @@ pub extern fn __rtcp_init() {
     });
 
     thread::sleep(std::time::Duration::from_secs(1));
+}
+
+
+#[no_mangle]
+pub extern fn __rtcp_fini() {
+    eprintln!("[RTCP] Finishing: closing sockets...");
+
+    loop {
+        let guard = FD2ID.lock().unwrap();
+    
+        if let Some((fd, _)) = guard.iter().next() {
+            eprintln!("[RTCP] Closing {}", fd.fd);
+
+            let fd = fd.fd;
+            drop(guard);
+            _ = posix_close(fd);
+        }
+        else {
+            break;
+        }
+    }
+
+    eprintln!("[RTCP] Waiting up to 40 seconds for all TCBs to close...");
+    for i in 1..41 {
+        let mut done = true;
+        print!("[{}] |", i);
+        for (idx, tcb) in TCBS.iter().enumerate() {
+            let guard = tcb.inner.lock().unwrap();
+            if guard.is_none() {
+                continue;
+            }
+            drop(guard);
+            
+            let state = tcp_status(idx);
+            if !matches!(state, TcpState::Closed) {
+                print!(" {}({:?}) | ", idx, state);
+                done = false;
+            }
+        }
+        print!("\n");
+        if done {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 #[no_mangle]
@@ -208,7 +253,7 @@ pub extern fn __wrap_send(socket: i32, buffer: *const c_void, length: size_t, fl
 
 #[no_mangle]
 pub extern fn __rtcp_close(fildes: i32) -> i32 {
-    eprintln!("close(fildes={})", fildes);
+    // eprintln!("close(fildes={})", fildes);
     // // Demo, TCP CLOSE
     // println!("[CLOSE] {:?}", tcp_close(10));
     // println!("[Status] {:?}\n===========================", tcp_status(10));

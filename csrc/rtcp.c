@@ -19,6 +19,15 @@ void __attribute__ ((constructor)) _rtcp_init(void) {
     __rtcp_init();
 }
 
+// Cleanup RTCP library.
+void __rtcp_fini(void);
+
+// This attribute makes the loader invoke this function before main()
+// We use this to invoke the initializer of RTCP library.
+void __attribute__ ((destructor)) _rtcp_fini(void) {
+    __rtcp_fini();
+}
+
 // Returns whether the FILDES is a RTCP managed socket
 int __rtcp_fildes_is_sock(int fildes);
 

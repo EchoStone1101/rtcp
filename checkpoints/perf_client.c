@@ -5,7 +5,7 @@
 #include "unp.h"
 #include <sys/time.h>
 
-#define SIZE (1460 * 100)
+#define SIZE (700 * 100)
 char sendline[SIZE];
 char recvline[SIZE];
 

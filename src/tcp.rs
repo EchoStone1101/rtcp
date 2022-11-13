@@ -1387,6 +1387,17 @@ pub mod tcp {
                                 tcb.recv_buf.rcv_nxt, true);
                         }
                     }
+                    else {
+                        if i32::wrapping_sub(tcb.send_buf.snd_una as i32, tcb.send_buf.iss as i32) <= 0 {
+                            // Simutaneous OPEN
+                            tcb.state = TcpState::SynReceived;
+
+                            // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+                            tcb.send_buf.send_syn(&tcb.conn, 
+                                tcb.recv_buf.rcv_wnd, 
+                                tcb.recv_buf.rcv_nxt, true);
+                        }
+                    }
                 }
             }
             _ => {
