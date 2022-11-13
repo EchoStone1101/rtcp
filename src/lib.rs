@@ -7,7 +7,6 @@ use std::net::Ipv4Addr;
 use std::thread;
 use std::collections::HashMap;
 use std::sync::{Mutex, Arc, Condvar};
-use array_macro::*;
 use lazy_static::*;
 
 pub mod tcp_segment;
@@ -49,12 +48,17 @@ pub const MAX_SOCKET_CNT: usize = 128;
 lazy_static! {
     /// Array of TCBs. Entry of None indicates the index is available
     /// for a new socket_fd.
-    pub static ref TCBS: [Arc<TCB>; MAX_SOCKET_CNT] = array![
-        Arc::new(TCB {
-            inner: Mutex::new(None),
-            retry: Condvar::new(),
-        }); MAX_SOCKET_CNT];
-    
+    pub static ref TCBS: Vec<Arc<TCB>> = {
+        let mut tcbs = Vec::with_capacity(MAX_SOCKET_CNT);
+        for _ in 0..MAX_SOCKET_CNT {
+            tcbs.push(Arc::new(TCB {
+                inner: Mutex::new(None),
+                retry: Condvar::new(),
+            }));
+        }
+        tcbs
+    };
+
     /// The underlying RIP control.
     pub static ref RIP: Arc<RipCtl> = Arc::new(RipCtl::init(true));
 
@@ -95,103 +99,126 @@ pub extern fn __rtcp_init() {
 
             // println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, &data[..std::cmp::min(data.len(), 20)]);
             
-            tcp_seg_arrive(10, TCPSegment {
-                header,
-                src_ip: ip_packet.hdr.src_ip,
-                data,
-            });
+            let conn = TcpConnection { 
+                src_ip: ip_packet.hdr.dst_ip,
+                dst_ip: ip_packet.hdr.src_ip,
+                src_port: header.dst_port, 
+                dst_port: header.src_port, 
+            };
+            if let Some(id) = posix_conn_to_id(&conn) {
+                tcp_seg_arrive(id, TCPSegment {
+                    header,
+                    src_ip: ip_packet.hdr.src_ip,
+                    data,
+                });
 
-            // println!("[Status] {:?}\n===========================", tcp_status(10));
+                // eprintln!("[RTCP] to TCB {}, {:?}", id, header);
+                eprintln!("[Status] id: {}, {:?}\n===========================", id, tcp_status(id));
+            }
+            else {
+                // eprintln!("[RTCP] Unknown TCB:\n{:?}\n{}\n", header, ip_packet.hdr.src_ip);
+            }
+
             
-
-            // if header.is_fin {
-            //     println!("[Status] {:?}\n===========================", tcp_status(10));
-            // }
 
         }
     });
 
+    // Ad-hoc: let RIP run and report local ip
+    thread::sleep(std::time::Duration::from_millis(1000));
 }
 
 #[no_mangle]
-pub extern fn __rtcp_fildes_is_sock(_fildes: i32) -> i32 {
-    0
+pub extern fn __rtcp_fildes_is_sock(fildes: i32) -> i32 {
+    if FD2ID.lock().unwrap().contains_key(&Fd::new(fildes)) {
+        1
+    }
+    else {
+        0
+    }
 }
 
 #[no_mangle]
 pub extern fn __wrap_socket(domain: i32, _type: i32, protocol: i32) -> i32 {
-    eprintln!("socket(domain={}, type={}, protocol={})", domain, _type, protocol);
-    
-    // Demo, TCP create
-    tcp_create(10, &mut TCBS[10].inner.lock().unwrap() ,RIP.tx.clone()).unwrap();
-    10
+    // eprintln!("socket(domain={}, type={}, protocol={})", domain, _type, protocol);
+    // // Demo, TCP create
+    // tcp_create(10, &mut TCBS[10].inner.lock().unwrap() ,RIP.tx.clone()).unwrap();
+    // 10
+
+    posix_socket(domain, _type, protocol).unwrap_or(-1)
 }
 
 #[no_mangle]
 pub extern fn __wrap_bind(socket: i32, address: *const sockaddr, address_len: socklen_t) -> i32 {
-    eprintln!("bind(socket={}, address={:p}, address_len={})", socket, address, address_len);
-    0
+    // eprintln!("bind(socket={}, address={:p}, address_len={})", socket, address, address_len);
+    
+    posix_bind(socket, address, address_len).unwrap_or(-1)
 }
 
 #[no_mangle]
 pub extern fn __wrap_listen(socket: i32, backlog: i32) -> i32 {
-    eprintln!("listen(socket={}, backlog={})", socket, backlog);
+    // eprintln!("listen(socket={}, backlog={})", socket, backlog);
+    // // Demo, TCP passive OPEN
+    // tcp_open(10, 5678, Ipv4Addr::new(10, 100, 1, 2), 5678, true).unwrap();
+    // 0
 
-    // Demo, TCP passive OPEN
-    tcp_open(10, 5678, Ipv4Addr::new(10, 100, 1, 2), 5678, true).unwrap();
-    0
+    posix_listen(socket, backlog).unwrap_or(-1)
 }
 
 #[no_mangle]
 pub extern fn __wrap_connect(socket: i32, address: *const sockaddr, address_len: socklen_t) -> i32 {
-    eprintln!("connect(socket={}, address={:p}, address_len={})", socket, address, address_len);
+    // eprintln!("connect(socket={}, address={:p}, address_len={})", socket, address, address_len);
+    // // Demo, TCP active OPEN
+    // tcp_open(10, 5678, Ipv4Addr::new(10, 100, 1, 1), 5678, false).unwrap();
+    // 0
 
-    // Demo, TCP active OPEN
-    tcp_open(10, 5678, Ipv4Addr::new(10, 100, 1, 1), 5678, false).unwrap();
-    0
+    posix_connect(socket, address, address_len).unwrap_or(-1)
 }
 
 #[no_mangle]
 pub extern fn __wrap_accept(socket: i32, address: *mut sockaddr, address_len: *mut socklen_t) -> i32 {
-    println!("accept(socket={}, address={:p}, address_len={:p})", socket, address, address_len);
-    0
+    // println!("accept(socket={}, address={:p}, address_len={:p})", socket, address, address_len);
+    // 0
+
+    posix_accept(socket, address, address_len).unwrap_or(-1)
 }
 
 #[no_mangle]
-#[allow(unused)]
 pub extern fn __wrap_recv(socket: i32, buffer: *mut c_void, length: size_t, flags: i32) -> ssize_t {
     // eprintln!("recv(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
-
     // Demo, TCP RECV
-    let mut buf = [0u8; 28000]; 
-    let res = tcp_recv(10, &mut buf, false, false);
-    // println!("[RECV] {:?}", res);
-    // println!("buf: {:?}", &buf[..20]);
-    // println!("[Status] {:?}\n===========================", tcp_status(10));
-    res.unwrap_or(0) as ssize_t
+    // let mut buf = [0u8; 28000]; 
+    // let res = tcp_recv(10, &mut buf, false, false);
+    // // println!("[RECV] {:?}", res);
+    // // println!("buf: {:?}", &buf[..20]);
+    // // println!("[Status] {:?}\n===========================", tcp_status(10));
+    // res.unwrap_or(0) as ssize_t
+
+    posix_recv(socket, buffer, length, flags).unwrap_or(-1)
 }
 
 #[no_mangle]
-#[allow(unused)]
 pub extern fn __wrap_send(socket: i32, buffer: *const c_void, length: size_t, flags: i32) -> ssize_t {
     // eprintln!("send(socket={}, buffer={:p}, length={}, flags={})", socket, buffer, length, flags);
-
     // Demo, TCP SEND
-    let buf = [0xccu8; 28000]; 
-    let res = tcp_send(10, &buf, false, false);
-    // println!("[SEND] {:?}", res);
-    // println!("[Status] {:?}\n===========================", tcp_status(10));
-    res.unwrap_or(0) as ssize_t
+    // let buf = [0xccu8; 28000]; 
+    // let res = tcp_send(10, &buf, false, false);
+    // // println!("[SEND] {:?}", res);
+    // // println!("[Status] {:?}\n===========================", tcp_status(10));
+    // res.unwrap_or(0) as ssize_t
+
+    posix_send(socket, buffer, length, flags).unwrap_or(-1)
 }
 
 #[no_mangle]
-pub extern fn __wrap_close(fildes: i32) -> i32 {
+pub extern fn __rtcp_close(fildes: i32) -> i32 {
     eprintln!("close(fildes={})", fildes);
+    // // Demo, TCP CLOSE
+    // println!("[CLOSE] {:?}", tcp_close(10));
+    // println!("[Status] {:?}\n===========================", tcp_status(10));
+    // 0
 
-    // Demo, TCP CLOSE
-    println!("[CLOSE] {:?}", tcp_close(10));
-    println!("[Status] {:?}\n===========================", tcp_status(10));
-    0
+    posix_close(fildes).unwrap_or(-1)
 }
 
 #[no_mangle]

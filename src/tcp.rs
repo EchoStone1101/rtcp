@@ -113,7 +113,7 @@ pub mod tcp {
 
         /// An identifier of this TCB, for the proper termination
         /// of the timer threads.
-        nonce: u64,
+        pub nonce: u64,
 
         /// Whether this TCB is finished.
         finished: bool,
@@ -176,6 +176,7 @@ pub mod tcp {
         pub end: u32,
         pub is_syn: bool,
         pub is_fin: bool,
+        pub is_ack: bool,
     }
 
     /// Sort by timestamp (and the end SEQ, should timestamp collide).
@@ -187,7 +188,7 @@ pub mod tcp {
         /// Put `data` into buffer, and register the segment 
         /// in re_tx_queue. The validity of this call should be
         /// checked beforehand.
-        fn put(&mut self, is_syn: bool, is_fin: bool, data: &[u8]) {
+        fn put(&mut self, is_syn: bool, is_fin: bool, is_ack: bool, data: &[u8]) {
             assert!(data.len() <= TCP_BUFFER_SZ as usize);
             assert!(u64::wrapping_add(self.snd_nxt as u64, data.len() as u64) <= u64::wrapping_add(self.snd_una as u64, self.snd_wnd as u64));
             let virt_len = data.len() as u32 
@@ -226,6 +227,7 @@ pub mod tcp {
                 end,
                 is_syn,
                 is_fin,
+                is_ack,
             };
             self.re_tx_queue_by_seq.push_back(item);
             assert!(self.re_tx_queue_by_ts.insert(
@@ -253,7 +255,7 @@ pub mod tcp {
                 _options: (),
             };
             // No actual data, must succeed
-            self.put(hdr.is_syn, hdr.is_fin, &[]);
+            self.put(hdr.is_syn, hdr.is_fin, is_ack, &[]);
             _ = RipCtl::send_ipv4_packet(
                 &mut self.tx,
                 conn.src_ip,
@@ -283,7 +285,7 @@ pub mod tcp {
                 _options: (),
             };
             // No actual data, must succeed
-            self.put(hdr.is_syn, hdr.is_fin, &[]);
+            self.put(hdr.is_syn, hdr.is_fin, true, &[]);
             _ = RipCtl::send_ipv4_packet(
                 &mut self.tx,
                 conn.src_ip,
@@ -409,7 +411,7 @@ pub mod tcp {
                     conn.src_ip, conn.dst_ip, 
                     &buf, 
                     &data[cur..cur+len]);
-                self.put(false, false, &data[cur..cur+len]);
+                self.put(false, false, true, &data[cur..cur+len]);
 
                 if len < RipCtl::MAX_PAYLOAD_SZ {
                     break;
@@ -440,7 +442,7 @@ pub mod tcp {
                 ack,
                 data_ofs: 5,
                 is_urg: false, is_psh: false, is_rst: false,
-                is_ack: true, is_fin: item.is_fin, is_syn: item.is_syn,
+                is_ack: item.is_ack, is_fin: item.is_fin, is_syn: item.is_syn,
                 wnd,
                 checksum: 0,
                 urg_ptr: 0,
@@ -692,7 +694,7 @@ pub mod tcp {
     }
 
     /// A TCP connection, identified by the quad.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct TcpConnection {
         pub src_ip: Ipv4Addr,
         pub dst_ip: Ipv4Addr,
