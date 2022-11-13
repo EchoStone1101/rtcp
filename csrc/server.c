@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 
 /// Passive open
 
@@ -18,7 +19,7 @@ int main() {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(0x0a640101);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = 5678;
 
     if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -29,21 +30,23 @@ int main() {
         perror("listen");
     }
 
-    // ssize_t rcvd = 0;
-    // ssize_t tot = 0;
-    // while ((rcvd = recv(10, NULL, 0, 0)) > 0) {
-    //     tot += rcvd;
-    // }
-
-    // printf("======================\n[Received] %ld\n======================\n", tot);
-
+    
     int connfd = accept(sock, NULL, NULL);
     if (connfd < 0) {
         perror("accept");
         return 0;
     }
+
+    ssize_t tot = (1l<<25); // 32MB
+    void *data = malloc(tot);
+
+    ssize_t rcvd = 0, _rcvd;
+    while ((_rcvd = read(connfd, data + rcvd, tot - rcvd)) > 0) {
+        rcvd += _rcvd;
+    }
+    printf("======================\n[Received] %ld\n======================\n", rcvd);
+
     
-    sleep(3);
     if (close(connfd) < 0) {
         perror("close");
     }

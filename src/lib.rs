@@ -93,10 +93,9 @@ pub extern fn __rtcp_init() {
             assert!(right >= left);
             let data = Vec::from(&ip_packet.data[left..right]);
 
-            // if header.is_fin {
+            // if header.is_rst {
             //     println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, &data[..std::cmp::min(data.len(), 20)]);
             // }
-
             // println!("{:?}\n{}\ndata: {:?}", header, ip_packet.hdr.src_ip, &data[..std::cmp::min(data.len(), 20)]);
             
             let conn = TcpConnection { 
@@ -113,19 +112,16 @@ pub extern fn __rtcp_init() {
                 });
 
                 // eprintln!("[RTCP] to TCB {}, {:?}", id, header);
-                eprintln!("[Status] id: {}, {:?}\n===========================", id, tcp_status(id));
+                // eprintln!("[Status] id: {}, {:?}\n===========================", id, tcp_status(id));
             }
             else {
-                // eprintln!("[RTCP] Unknown TCB:\n{:?}\n{}\n", header, ip_packet.hdr.src_ip);
+                eprintln!("[RTCP] Unknown TCB:\n{:?}\n", header);
             }
-
-            
 
         }
     });
 
-    // Ad-hoc: let RIP run and report local ip
-    thread::sleep(std::time::Duration::from_millis(1000));
+    thread::sleep(std::time::Duration::from_secs(1));
 }
 
 #[no_mangle]
@@ -228,13 +224,14 @@ pub extern fn __wrap_getaddrinfo(
     hints: *const addrinfo,
     res: *mut *mut addrinfo) -> i32 
 {
-    let node = unsafe { CStr::from_ptr(node) };
-    let service = unsafe { CStr::from_ptr(service) };
-    println!("getaddrinfo(node={}, service={}, hints={:p}, res={:p})", 
-        node.to_str().unwrap_or_default(),
-        service.to_str().unwrap_or_default(),
-        hints,
-        res,
-    );
-    0
+    // let node = unsafe { CStr::from_ptr(node) };
+    // let service = unsafe { CStr::from_ptr(service) };
+    // println!("getaddrinfo(node={}, service={}, hints={:p}, res={:p})", 
+    //     node.to_str().unwrap_or_default(),
+    //     service.to_str().unwrap_or_default(),
+    //     hints,
+    //     res,
+    // );
+    // 0
+    posix_getaddrinfo(node, service, hints, res)
 }

@@ -430,7 +430,8 @@ pub mod tcp {
             if left > TCP_BUFFER_SZ as u16 {
                 left -= TCP_BUFFER_SZ as u16;
             }
-            let right = u32::wrapping_sub(item.end, item.start) as u16 + left;
+            let right = u32::wrapping_sub(u32::wrapping_sub(item.end, if item.is_fin {1} else {0}), item.start) as u16 + left;
+
             assert!(left <= right);
 
             let mut hdr_buf = [0u8; 20];
@@ -919,7 +920,7 @@ pub mod tcp {
                         // Timeout!
                         if matches!(tcb.state, TcpState::TimeWait) {
                             tcb.clear();
-                            // eprintln!("time wait done!");
+                            eprintln!("[RTCP] TimeWait {} done", id);
                             break;
                         }
                         else {
@@ -1598,7 +1599,7 @@ pub mod tcp {
                                 let (_, fin_acked, _) = tcb.send_buf.ack(seg.header.ack);
                                 if fin_acked {
                                     // MSL timer
-                                    tcb.ragnarok = Some(tcp_timestamp() + 2 * TCP_MSL as u64);
+                                    tcb.ragnarok = Some(tcp_timestamp() + 2 * 1000 * TCP_MSL as u64);
                                 }
                             }
                             return;

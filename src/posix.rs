@@ -7,16 +7,15 @@ pub mod posix {
     #[allow(unused)]
     
     use std::hash::Hash;
+    use std::str::FromStr;
     use std::collections::{HashMap, VecDeque};
-    use libc::{sockaddr, socklen_t, sockaddr_in, ssize_t, c_void, size_t};
+    use libc::{sockaddr, socklen_t, sockaddr_in, ssize_t, c_void, size_t, c_char, addrinfo};
     use crate::tcp::tcp::*;
     use crate::{RtcpError, TCBS, RIP, FD2ID, Ipv4Addr, TCT};
 
     use errno::{set_errno, Errno};
 
-
     pub const POSIX_MAX_LISTEN_BACKLOG: usize = 16;
-
 
     /// POSIX file descriptor, provided to the end user.
     /// All POSIX interface use FD to refer to sockets, while internally we
@@ -97,7 +96,7 @@ pub mod posix {
         pub fn next_ephemeral_port(&self, ip: Ipv4Addr) -> Option<u16> {
             let ports = self.src_ip_map.get(&ip);
             if let None = ports {
-                Some(TCP_EPHEMERAL_PORT_LBOUND)
+                Some(u16::clamp(tcp_timestamp() as u16, TCP_EPHEMERAL_PORT_LBOUND, u16::MAX ))
             }
             else {
                 let ports = ports.unwrap();
@@ -186,6 +185,8 @@ pub mod posix {
         let fd = Fd {fd, _non_block: if _type & libc::SOCK_NONBLOCK != 0 {true} else {false} };
         FD2ID.lock().unwrap().insert(fd, id);
 
+        eprintln!("[RTCP] socket fd {} on id {}", fd.fd, id);
+
         Ok(fd.fd)
     }
 
@@ -226,7 +227,7 @@ pub mod posix {
         }
 
         // Port
-        let mut port = sin_port;
+        let mut port = sin_port.to_be();
         let mut tct = TCT.lock().unwrap();
         if port == TCP_UNSPECIFIED_PORT {
             if let Some(p) = tct.next_ephemeral_port(ip) {
@@ -347,7 +348,7 @@ pub mod posix {
 
         let ip_bytes = sin_addr.s_addr.to_le_bytes();
         let dst_ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-        let dst_port = sin_port;
+        let dst_port = sin_port.to_be();
 
 
         // Grab locks
@@ -432,13 +433,14 @@ pub mod posix {
                 TcpState::Established | TcpState::SynReceived => {
                     // Done!
                     break;
-                }
+                },
                 _ => {
+                    println!("Hello: {:?}", tcb.state);
                     _ = tcp_abort(id, &mut guard);
                     // The cleanup should be done by user calling close()
                     set_errno(Errno(libc::ETIMEDOUT));
                     return Err(RtcpError::FailedPOSIX);
-                }
+                },
             }
 
         }
@@ -659,15 +661,18 @@ pub mod posix {
             set_errno(Errno(libc::EBADF));
             return Err(RtcpError::FailedPOSIX);
         };
-        let mut tct = TCT.lock().unwrap();
-        let mut tcb_guard = TCBS[id].inner.lock().unwrap();
+        let tct = TCT.lock().unwrap();
+        let tcb_guard = TCBS[id].inner.lock().unwrap();
         assert!(tcb_guard.is_some());
-        let tcb = tcb_guard.as_mut().unwrap(); // ...these are for the listen()-ed socket
 
-        let src_ip = tcb.conn.src_ip;
-        let src_port = tcb.conn.src_port;
-        tct.remove_src_socket(src_ip, src_port);
-        _ = tct.conn_map.remove(&tcb.conn);
+        // let tcb = tcb_guard.as_mut().unwrap(); // ...these are for the listen()-ed socket
+
+        // let src_ip = tcb.conn.src_ip;
+        // let src_port = tcb.conn.src_port;
+
+        // Don't do this, or FIN can not be transported
+        // tct.remove_src_socket(src_ip, src_port);
+        // _ = tct.conn_map.remove(&tcb.conn);
 
         fd2id_guard.remove(&fd);
 
@@ -677,15 +682,140 @@ pub mod posix {
         // Now that all FD related records are cleaned up, won't
         // be closing twice.
 
+        // TODO: Actually free the TCB, and properly handle closing
+        // of a listen()-ed FD.
+
         drop(tcb_guard);
         drop(tct);
         drop(fd2id_guard);
 
         _ = tcp_close(id);
 
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        println!("{:?}", tcp_status(id));
         Ok(0)
+    }
+
+
+    /// POSIX getaddrinfo()
+    /// A simple wrapper, only translate IP and port from string to number.
+    /// Warning: not well tested, and passing rust Boxed value is generally a bad idea.
+    pub fn posix_getaddrinfo(
+        node: *const c_char,
+        service: *const c_char,
+        hints: *const addrinfo,
+        res: *mut *mut addrinfo) -> i32
+    {
+        // Check for hints
+        if !hints.is_null() {
+            let &hints = unsafe { &*hints as &addrinfo };
+            if hints.ai_family != libc::AF_INET {
+                return libc::EAI_FAMILY;
+            }
+            if hints.ai_socktype != libc::IPPROTO_TCP {
+                return libc::EAI_SOCKTYPE;
+            }
+            if hints.ai_flags != 0 {
+                return libc::EAI_BADFLAGS;
+            }
+        }
+
+        // Translate node to ip, service to port
+        let ip = if node.is_null() {
+            Ipv4Addr::UNSPECIFIED
+        }
+        else {
+            Ipv4Addr::from_str(unsafe {
+                let len = libc::strlen(node);
+                let slice = std::slice::from_raw_parts(node as *const u8, len);
+                std::str::from_utf8_unchecked(slice)
+            }).unwrap()
+        };
+
+        let port = if service.is_null() {
+            0u16
+        }
+        else {
+            u16::from_str(unsafe {
+                let len = libc::strlen(service);
+                let slice = std::slice::from_raw_parts(service as *const u8, len);
+                std::str::from_utf8_unchecked(slice)
+            }).unwrap()
+        };
+
+        let local_ips = RIP.local_ip.lock().unwrap().clone();
+
+        if ip.is_unspecified() {
+            // Return all local IPs
+            let mut pinfo = None;
+            for local_ip in local_ips {
+                unsafe {
+                    let mut info = Box::new(
+                        addrinfo {
+                            ai_flags: 0,
+                            ai_family: libc::AF_INET,
+                            ai_socktype: libc::SOCK_STREAM,
+                            ai_protocol: libc::IPPROTO_TCP,
+                            ai_addrlen: 16,
+                            ai_addr: Box::new(std::mem::transmute::<sockaddr_in, sockaddr>(sockaddr_in {
+                                sin_family: libc::AF_INET as u16,
+                                sin_port: port,
+                                sin_addr: libc::in_addr {
+                                    s_addr: u32::from_be_bytes(local_ip.octets()),
+                                },
+                                sin_zero: [0u8; 8],
+                            })).as_mut(),
+                            ai_canonname: 0 as *mut i8,
+                            ai_next: 0 as *mut addrinfo,
+                        }
+                    );
+                    if pinfo.is_none() {
+                        _ = pinfo.insert(info);
+                    }
+                    else {
+                        let old_info = pinfo.take();
+                        info.ai_next = old_info.unwrap().as_mut() as *mut addrinfo;
+                        _ = pinfo.insert(info);
+                    }
+                }
+            }
+            if pinfo.is_none() {
+                unsafe {
+                    *res = 0 as *mut addrinfo;
+                }
+            }
+            else {
+                unsafe {
+                    let info = pinfo.take();
+                    *res = info.unwrap().as_mut() as *mut addrinfo;
+                }
+            }
+        }
+        else {
+            // Return ip
+            unsafe {
+                let mut info = Box::new(
+                    addrinfo {
+                        ai_flags: 0,
+                        ai_family: libc::AF_INET,
+                        ai_socktype: libc::SOCK_STREAM,
+                        ai_protocol: libc::IPPROTO_TCP,
+                        ai_addrlen: 16,
+                        ai_addr: Box::new(std::mem::transmute::<sockaddr_in, sockaddr>(sockaddr_in {
+                            sin_family: libc::AF_INET as u16,
+                            sin_port: port,
+                            sin_addr: libc::in_addr {
+                                s_addr: u32::from_be_bytes(ip.octets()),
+                            },
+                            sin_zero: [0u8; 8],
+                        })).as_mut(),
+                        ai_canonname: 0 as *mut i8,
+                        ai_next: 0 as *mut addrinfo,
+                    }
+                );
+                *res = info.as_mut() as *mut addrinfo;
+            }
+        }
+
+        0
     }
 
 
@@ -771,4 +901,6 @@ pub mod posix {
             }
         }
     }
+
+
 }
